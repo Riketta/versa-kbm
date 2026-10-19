@@ -51,9 +51,7 @@ cargo build --release -p vkbm-cli     # the vkbm CLI
 cargo test                            # protocol + client tests
 ```
 
-Firmware (`thumbv6m-none-eabi` target required: `rustup target add
-thumbv6m-none-eabi`; `picotool` must be on your PATH for flashing — adjust
-`crates/vkbm-fw/.cargo/config.toml` if yours lives elsewhere):
+Firmware (toolchain and flashing setup: see [Flashing](#flashing)):
 
 ```sh
 cd crates/vkbm-fw
@@ -61,9 +59,35 @@ cargo build --features dev-cdc        # dev build with the CDC bench port
 cargo run --features dev-cdc          # build + flash via picotool
 ```
 
-Flash a blank Pico with BOOTSEL held; afterwards `cargo run` reflashes
-directly. The `dev-cdc` feature adds the bench serial port — production
-builds (no features) enumerate as HID only.
+The `dev-cdc` feature adds the bench serial port — production builds (no
+features) enumerate as HID only.
+
+## Flashing
+
+Prerequisites: the `thumbv6m-none-eabi` target (`rustup target add
+thumbv6m-none-eabi`) and `picotool` on your `PATH` (if it lives elsewhere,
+point the runner at it in `crates/vkbm-fw/.cargo/config.toml`).
+
+**First flash** (blank board, or recovery): hold **BOOTSEL** while plugging
+the board into USB — it comes up in the stock bootloader. Then, from
+`crates/vkbm-fw`:
+
+```sh
+cargo run --features dev-cdc   # build + flash + boot the new image
+```
+
+The runner (`picotool load --update --verify --execute -t elf`, see
+`crates/vkbm-fw/.cargo/config.toml`) finds the bootloader-mode board,
+flashes the freshly built ELF and reboots straight into the firmware.
+
+**Reflashing** works the same way: the running firmware cannot be
+reprogrammed through the vendor channel, so always put the board into
+BOOTSEL mode first — unplug, hold BOOTSEL, plug back in — then `cargo run`
+again.
+
+**Verify** with the CLI: `vkbm ping` for a handshake, `vkbm info` — a
+freshly flashed board reports the current crate version and
+`switch=on arm=on`.
 
 ## CLI usage
 
