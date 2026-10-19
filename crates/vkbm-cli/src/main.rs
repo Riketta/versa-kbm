@@ -26,6 +26,7 @@ use vkbm_cli::{
     find_device,
 };
 use vkbm_proto::{
+    ABS_MAX,
     Button,
     Command,
 };
@@ -67,8 +68,10 @@ enum Cmd {
     /// Move the pointer to an absolute position (`0..=32767` per axis).
     Move {
         /// Absolute X.
+        #[arg(value_parser = clap::value_parser!(u16).range(0..=i64::from(ABS_MAX)))]
         x: u16,
         /// Absolute Y.
+        #[arg(value_parser = clap::value_parser!(u16).range(0..=i64::from(ABS_MAX)))]
         y: u16,
     },
     /// Move the pointer by a relative delta. Relative moves are anchored to
@@ -83,8 +86,10 @@ enum Cmd {
     /// Move to an absolute position and left-click it.
     Press {
         /// Absolute X.
+        #[arg(value_parser = clap::value_parser!(u16).range(0..=i64::from(ABS_MAX)))]
         x: u16,
         /// Absolute Y.
+        #[arg(value_parser = clap::value_parser!(u16).range(0..=i64::from(ABS_MAX)))]
         y: u16,
     },
     /// Send a keyboard usage (HID usage code): tap by default.

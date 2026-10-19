@@ -86,7 +86,8 @@ BOOTSEL mode first — unplug, hold BOOTSEL, plug back in — then `cargo run`
 again.
 
 **Verify** with the CLI: `vkbm ping` for a handshake, `vkbm info` — a
-freshly flashed board reports the current crate version and
+freshly flashed board reports the firmware crate's own version
+(`crates/vkbm-fw` is versioned independently of the host crates') and
 `switch=on arm=on`.
 
 ## CLI usage
@@ -119,9 +120,11 @@ arm=..` (for `INFO`), or `ERR ...` with a reason code.
 A short tap on the board's BOOTSEL button toggles the device on or off
 independently of any software:
 
-- **Off:** every actuation command is refused with `ERR DISABLED`, and any
-  held keys or buttons are released at the moment of the toggle. The host
-  can see the state (`vkbm info` prints `switch=off`) but cannot clear it.
+- **Off:** every actuation command is refused with `ERR DISABLED`; held
+  keys and buttons are released the moment the toggle lands, and any
+  actuation still queued but not yet executed is dropped at the gate (only
+  a command already mid-sequence can finish). The host can see the state
+  (`vkbm info` prints `switch=off`) but cannot clear it.
 - **On:** the device acts normally, still subject to the soft
   `DISARM`/`ARM` gate.
 - The board LED is solid only when the device can actuate (switch on and
@@ -148,6 +151,19 @@ automatic resend would otherwise execute twice. A repeated sequence replays
 the cached reply instead. If you raise pacing above the ack timeout
 (`--timeout-ms`, default 250), raise the timeout with it.
 
+Two safeguards keep a repeated sequence from ever swallowing a fresh
+command: the host seeds each process's sequence counter from clock and
+process id (so a new CLI session almost never starts at the number the
+last session left cached), and the device only replays a repeated
+sequence within a 2 s window of its first execution (a true resend
+arrives within the ack timeout, well under that window). A fresh
+session's first command therefore always executes.
+
+Absolute coordinates travel as `0..=32767` (`ABS_MAX`) per axis; values
+above that are clamped by the device. Wheel and pan ticks are `i8` on
+the wire, clamped by the firmware to the −127..=127 range its HID
+descriptor declares.
+
 ## Device identity
 
 The USB identity (VID/PID and strings) is defined by constants near the top
@@ -172,6 +188,11 @@ Change the constants if your use case needs a different appearance.
   target machine makes it land elsewhere. Prefer absolute moves.
 - A key or button held across a failed command stays latched;
   `vkbm release` (line `RA`) always clears everything, even disarmed.
+- Tapping an already-held key or button releases it (a tap is
+  press + release).
+- If the firmware itself panics, the last HID report stays latched until
+  the board is replugged: the panic handler halts the core. No reachable
+  panic paths are known, but a halted device cannot release anything.
 - Keyboard LED output reports (caps/num-lock state from the host) are not
   consumed; the virtual keyboard does not mirror them.
 

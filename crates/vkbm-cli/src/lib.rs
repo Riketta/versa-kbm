@@ -5,6 +5,10 @@
 //! round-trip, one resend on a lost ack, stale replies discarded.
 
 use core::time::Duration;
+use std::time::{
+    SystemTime,
+    UNIX_EPOCH,
+};
 
 use hidapi::{
     HidApi,
@@ -133,6 +137,26 @@ impl Link for HidLink {
     }
 }
 
+/// Seeds the per-process sequence counter. The device dedups by sequence
+/// number, so a fresh CLI process must not start at the number the previous
+/// session last used - the device would replay that session's cached reply
+/// and the command would be swallowed. Clock subsecond nanoseconds and the
+/// OS process id, mixed byte by byte, spread the starting points; zero maps
+/// to 1 because 0 is the device's never-executed slot.
+fn initial_seq() -> u8 {
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+    let pid = std::process::id();
+    #[allow(clippy::cast_possible_truncation)] // a byte-wide mix is the point
+    {
+        let mixed = (nanos as u8)
+            ^ ((nanos >> 8) as u8)
+            ^ (pid as u8)
+            ^ ((pid >> 8) as u8)
+            ^ ((pid >> 16) as u8);
+        if mixed == 0 { 1 } else { mixed }
+    }
+}
+
 /// Request client over the vendor control channel.
 pub struct Client {
     link: Box<dyn Link>,
@@ -148,7 +172,7 @@ impl Client {
     pub fn open(api: &HidApi, vid: u16, pid: u16) -> Result<Self, Error> {
         let info = find_device(api, vid, pid).ok_or(Error::NotFound)?;
         let device = api.open_path(info.path()).map_err(Error::Open)?;
-        Ok(Self { link: Box::new(HidLink { device }), next_seq: 1 })
+        Ok(Self { link: Box::new(HidLink { device }), next_seq: initial_seq() })
     }
 
     /// Sends one command and waits for its ack; a lost ack is resent once.
@@ -235,6 +259,7 @@ mod tests {
     use super::{
         Error,
         Link,
+        initial_seq,
         issue,
     };
 
@@ -359,6 +384,16 @@ mod tests {
         let reply = issue(&mut link, &frame_for(1), 1, TIMEOUT);
         assert!(matches!(reply, Err(Error::Timeout)));
         assert_eq!(link.sent(), 2, "the resend still happens once, then give up");
+    }
+
+    #[test]
+    fn initial_seq_stays_in_host_range() {
+        // The wire contract reserves 0 as "never executed" on the device;
+        // the seed must never produce it.
+        for _ in 0..256 {
+            let seq = initial_seq();
+            assert!((1..=u8::MAX).contains(&seq), "seeded seq {seq} outside 1..=255");
+        }
     }
 
     #[test]

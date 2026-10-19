@@ -37,6 +37,9 @@ impl core::fmt::Display for FrameError {
     }
 }
 
+// Command and reply tags live in disjoint, direction-specific spaces:
+// `decode` reads command tags, `decode_reply` reads reply tags. They must
+// never be mixed - a command tag is meaningless as a reply tag.
 mod tag {
     pub(super) const PING: u8 = 0x01;
     pub(super) const INFO: u8 = 0x02;
@@ -69,61 +72,61 @@ mod tag {
 /// Encodes `cmd` into `out` under sequence number `seq`, zero-padding the
 /// remainder.
 pub fn encode(cmd: &Command, seq: u8, out: &mut [u8; FRAME_LEN]) {
-    let mut buf = [0u8; FRAME_LEN];
-    buf[0] = seq;
+    *out = [0u8; FRAME_LEN];
+    out[0] = seq;
     match *cmd {
-        Command::Ping => buf[1] = tag::PING,
-        Command::Info => buf[1] = tag::INFO,
+        Command::Ping => out[1] = tag::PING,
+        Command::Info => out[1] = tag::INFO,
         Command::KeyDown { usage } => {
-            buf[1] = tag::KEY_DOWN;
-            buf[2] = usage;
+            out[1] = tag::KEY_DOWN;
+            out[2] = usage;
         }
         Command::KeyUp { usage } => {
-            buf[1] = tag::KEY_UP;
-            buf[2] = usage;
+            out[1] = tag::KEY_UP;
+            out[2] = usage;
         }
         Command::KeyTap { usage } => {
-            buf[1] = tag::KEY_TAP;
-            buf[2] = usage;
+            out[1] = tag::KEY_TAP;
+            out[2] = usage;
         }
         Command::MouseMoveAbs { x, y } => {
-            buf[1] = tag::MOVE_ABS;
-            buf[2..4].copy_from_slice(&x.to_le_bytes());
-            buf[4..6].copy_from_slice(&y.to_le_bytes());
+            out[1] = tag::MOVE_ABS;
+            out[2..4].copy_from_slice(&x.to_le_bytes());
+            out[4..6].copy_from_slice(&y.to_le_bytes());
         }
         Command::MouseMoveRel { dx, dy } => {
-            buf[1] = tag::MOVE_REL;
-            buf[2..4].copy_from_slice(&dx.to_le_bytes());
-            buf[4..6].copy_from_slice(&dy.to_le_bytes());
+            out[1] = tag::MOVE_REL;
+            out[2..4].copy_from_slice(&dx.to_le_bytes());
+            out[4..6].copy_from_slice(&dy.to_le_bytes());
         }
         Command::MouseDown { button } => {
-            buf[1] = tag::MOUSE_DOWN;
-            buf[2] = button as u8;
+            out[1] = tag::MOUSE_DOWN;
+            out[2] = button as u8;
         }
         Command::MouseUp { button } => {
-            buf[1] = tag::MOUSE_UP;
-            buf[2] = button as u8;
+            out[1] = tag::MOUSE_UP;
+            out[2] = button as u8;
         }
         Command::ClickAbs { x, y } => {
-            buf[1] = tag::CLICK_ABS;
-            buf[2..4].copy_from_slice(&x.to_le_bytes());
-            buf[4..6].copy_from_slice(&y.to_le_bytes());
+            out[1] = tag::CLICK_ABS;
+            out[2..4].copy_from_slice(&x.to_le_bytes());
+            out[4..6].copy_from_slice(&y.to_le_bytes());
         }
+        #[allow(clippy::cast_sign_loss)] // for an i8, the low byte *is* the wire byte
         Command::Wheel { v, h } => {
-            buf[1] = tag::WHEEL;
-            buf[2] = v.to_le_bytes()[0];
-            buf[3] = h.to_le_bytes()[0];
+            out[1] = tag::WHEEL;
+            out[2] = v as u8;
+            out[3] = h as u8;
         }
-        Command::ReleaseAll => buf[1] = tag::RELEASE_ALL,
-        Command::Arm => buf[1] = tag::ARM,
-        Command::Disarm => buf[1] = tag::DISARM,
+        Command::ReleaseAll => out[1] = tag::RELEASE_ALL,
+        Command::Arm => out[1] = tag::ARM,
+        Command::Disarm => out[1] = tag::DISARM,
         Command::SetPacing { inter_ms, hold_ms } => {
-            buf[1] = tag::SET_PACING;
-            buf[2] = inter_ms;
-            buf[3] = hold_ms;
+            out[1] = tag::SET_PACING;
+            out[2] = inter_ms;
+            out[3] = hold_ms;
         }
     }
-    *out = buf;
 }
 
 /// Decodes one frame; returns `(seq, command)`.

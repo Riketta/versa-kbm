@@ -90,6 +90,7 @@ use vkbm_proto::{
         FrameError,
     },
     info_flags,
+    routing,
 };
 
 bind_interrupts!(struct Irqs {
@@ -244,9 +245,10 @@ async fn main(spawner: Spawner) {
     config.max_power = 100;
     config.max_packet_size_0 = 64;
 
-    // All HID/CDC state must be declared before `builder`: the classes
-    // register their state borrows inside it, so the states must drop first
-    // (Rust drops in reverse declaration order).
+    // HID/CDC state is declared before `builder`: Rust drops locals in
+    // reverse declaration order, so the states drop LAST - after the USB
+    // classes that borrow them are created inside `builder`. That drop
+    // ordering is what the class borrows require.
     let mut kb_state = State::new();
     let mut mouse_state = State::new();
     let mut vendor_state = State::new();
@@ -314,83 +316,102 @@ async fn main(spawner: Spawner) {
         let mut mouse_pos = MouseState::new();
         loop {
             let (caller, cmd) = ACT_CMD.receive().await;
-            let reply = match cmd {
-                Command::KeyDown { usage } => {
-                    if kb_keys.down(usage) {
-                        emit_kb(&mut kb, &kb_keys).await;
-                        Reply::Ok
-                    } else {
-                        // Dropped, not latched: report it instead of acking
-                        // a tap that would never happen.
-                        Reply::Err(ErrorCode::KeyboardFull)
+            // Re-check the gates at execution time: a command can sit queued
+            // in the channel while the switch flips or `Disarm` lands, and
+            // queued actuation must not slip through behind a closed gate.
+            // Release-class commands bypass this entirely (see
+            // `routing::is_new_actuation`).
+            let gate = if routing::is_new_actuation(&cmd) {
+                routing::gate_error(ENABLED.load(Ordering::Relaxed), ARMED.load(Ordering::Relaxed))
+            } else {
+                None
+            };
+            let reply = match gate {
+                Some(code) => Reply::Err(code),
+                None => match cmd {
+                    Command::KeyDown { usage } => {
+                        if kb_keys.down(usage) {
+                            emit_kb(&mut kb, &kb_keys).await;
+                            Reply::Ok
+                        } else {
+                            // Dropped, not latched: report it instead of acking
+                            // a tap that would never happen.
+                            Reply::Err(ErrorCode::KeyboardFull)
+                        }
                     }
-                }
-                Command::KeyUp { usage } => {
-                    kb_keys.up(usage);
-                    emit_kb(&mut kb, &kb_keys).await;
-                    Reply::Ok
-                }
-                Command::KeyTap { usage } => {
-                    if kb_keys.down(usage) {
-                        emit_kb(&mut kb, &kb_keys).await;
-                        Timer::after_millis(hold_ms()).await;
+                    Command::KeyUp { usage } => {
                         kb_keys.up(usage);
                         emit_kb(&mut kb, &kb_keys).await;
                         Reply::Ok
-                    } else {
-                        Reply::Err(ErrorCode::KeyboardFull)
                     }
-                }
-                Command::MouseMoveAbs { x, y } => {
-                    mouse_pos.move_abs(x, y);
-                    emit_mouse(&mut mouse, &mouse_pos, 0, 0).await;
-                    Reply::Ok
-                }
-                Command::MouseMoveRel { dx, dy } => {
-                    mouse_pos.move_rel(dx, dy);
-                    emit_mouse(&mut mouse, &mouse_pos, 0, 0).await;
-                    Reply::Ok
-                }
-                Command::MouseDown { button } => {
-                    mouse_pos.down(button);
-                    emit_mouse(&mut mouse, &mouse_pos, 0, 0).await;
-                    Reply::Ok
-                }
-                Command::MouseUp { button } => {
-                    mouse_pos.up(button);
-                    emit_mouse(&mut mouse, &mouse_pos, 0, 0).await;
-                    Reply::Ok
-                }
-                Command::ClickAbs { x, y } => {
-                    mouse_pos.move_abs(x, y);
-                    emit_mouse(&mut mouse, &mouse_pos, 0, 0).await;
-                    Timer::after_millis(inter_ms()).await;
-                    mouse_pos.down(Button::Left);
-                    emit_mouse(&mut mouse, &mouse_pos, 0, 0).await;
-                    Timer::after_millis(hold_ms()).await;
-                    mouse_pos.up(Button::Left);
-                    emit_mouse(&mut mouse, &mouse_pos, 0, 0).await;
-                    Reply::Ok
-                }
-                Command::Wheel { v, h } => {
-                    emit_mouse(&mut mouse, &mouse_pos, v, h).await;
-                    Timer::after_millis(inter_ms()).await;
-                    emit_mouse(&mut mouse, &mouse_pos, 0, 0).await;
-                    Reply::Ok
-                }
-                Command::ReleaseAll => {
-                    kb_keys.clear();
-                    emit_kb(&mut kb, &kb_keys).await;
-                    mouse_pos.clear();
-                    emit_mouse(&mut mouse, &mouse_pos, 0, 0).await;
-                    Reply::Ok
-                }
-                // Dispatch never routes config commands here.
-                Command::Ping
-                | Command::Info
-                | Command::Arm
-                | Command::Disarm
-                | Command::SetPacing { .. } => Reply::Ok,
+                    Command::KeyTap { usage } => {
+                        if kb_keys.down(usage) {
+                            emit_kb(&mut kb, &kb_keys).await;
+                            Timer::after_millis(hold_ms()).await;
+                            kb_keys.up(usage);
+                            emit_kb(&mut kb, &kb_keys).await;
+                            Reply::Ok
+                        } else {
+                            Reply::Err(ErrorCode::KeyboardFull)
+                        }
+                    }
+                    Command::MouseMoveAbs { x, y } => {
+                        mouse_pos.move_abs(x, y);
+                        emit_mouse(&mut mouse, &mouse_pos, 0, 0).await;
+                        Reply::Ok
+                    }
+                    Command::MouseMoveRel { dx, dy } => {
+                        mouse_pos.move_rel(dx, dy);
+                        emit_mouse(&mut mouse, &mouse_pos, 0, 0).await;
+                        Reply::Ok
+                    }
+                    Command::MouseDown { button } => {
+                        mouse_pos.down(button);
+                        emit_mouse(&mut mouse, &mouse_pos, 0, 0).await;
+                        Reply::Ok
+                    }
+                    Command::MouseUp { button } => {
+                        mouse_pos.up(button);
+                        emit_mouse(&mut mouse, &mouse_pos, 0, 0).await;
+                        Reply::Ok
+                    }
+                    Command::ClickAbs { x, y } => {
+                        mouse_pos.move_abs(x, y);
+                        emit_mouse(&mut mouse, &mouse_pos, 0, 0).await;
+                        Timer::after_millis(inter_ms()).await;
+                        mouse_pos.down(Button::Left);
+                        emit_mouse(&mut mouse, &mouse_pos, 0, 0).await;
+                        Timer::after_millis(hold_ms()).await;
+                        mouse_pos.up(Button::Left);
+                        emit_mouse(&mut mouse, &mouse_pos, 0, 0).await;
+                        Reply::Ok
+                    }
+                    Command::Wheel { v, h } => {
+                        // The HID descriptor declares the wheel/pan logical
+                        // range as -127..=127, but the wire i8 carries -128;
+                        // out-of-range values would wrap at the OS, so clamp
+                        // to the descriptor's range.
+                        let v = v.clamp(-127, 127);
+                        let h = h.clamp(-127, 127);
+                        emit_mouse(&mut mouse, &mouse_pos, v, h).await;
+                        Timer::after_millis(inter_ms()).await;
+                        emit_mouse(&mut mouse, &mouse_pos, 0, 0).await;
+                        Reply::Ok
+                    }
+                    Command::ReleaseAll => {
+                        kb_keys.clear();
+                        emit_kb(&mut kb, &kb_keys).await;
+                        mouse_pos.clear();
+                        emit_mouse(&mut mouse, &mouse_pos, 0, 0).await;
+                        Reply::Ok
+                    }
+                    // Dispatch never routes config commands here.
+                    Command::Ping
+                    | Command::Info
+                    | Command::Arm
+                    | Command::Disarm
+                    | Command::SetPacing { .. } => Reply::Ok,
+                },
             };
             match caller {
                 Caller::Vendor => VENDOR_REPLY.signal(reply),
@@ -407,17 +428,20 @@ async fn main(spawner: Spawner) {
         // Duplicate suppression for the host's one-resend policy: the device
         // acks after execution, so a paced command can outlive the host's
         // ack timeout and the resend must replay the cached reply instead of
-        // executing twice (double tap, double click).
+        // executing twice (double tap, double click). The replay window
+        // keeps that promise short, so a fresh host session starting at the
+        // cached sequence number executes normally.
         let mut dedup = SeqDedup::new();
         loop {
             let raw = VENDOR_EVENTS.receive().await;
+            let now_ms = embassy_time::Instant::now().as_millis();
             let reply = match frame::decode(&raw) {
                 Ok((seq, cmd)) => {
-                    if let Some(cached) = dedup.replay(seq) {
+                    if let Some(cached) = dedup.replay(seq, now_ms) {
                         cached
                     } else {
                         let reply = dispatch(Caller::Vendor, cmd).await;
-                        dedup.remember(seq, reply);
+                        dedup.remember(seq, reply, now_ms);
                         reply
                     }
                 }
@@ -567,35 +591,26 @@ fn sample_cs_line() -> bool {
 /// Config commands are served inline; actuation is forwarded to the actuator
 /// loop and `ReleaseAll` bypasses the armed gate (safety release).
 async fn dispatch(caller: Caller, cmd: Command) -> Reply {
-    // Commands that may be refused while disarmed: everything that causes
-    // NEW actuation. Pure releases and the config/queries always work - you
-    // must be able to let go of a held key without arming first.
-    let new_actuation = !matches!(
-        cmd,
-        Command::Ping
-            | Command::Info
-            | Command::Arm
-            | Command::Disarm
-            | Command::ReleaseAll
-            | Command::KeyUp { .. }
-            | Command::MouseUp { .. }
-            | Command::SetPacing { .. }
-    );
+    // Commands that may be refused while gated: everything that causes
+    // NEW actuation (`routing::is_new_actuation`). Pure releases and the
+    // config/queries always work - you must be able to let go of a held
+    // key without arming first. The actuator loop re-checks the same gates
+    // at execution time, because a command can sit queued while the gate
+    // closes.
+    if routing::is_new_actuation(&cmd) {
+        // The hardware switch outranks the soft arm gate: while it is off,
+        // nothing actuates no matter what the host armed.
+        if let Some(code) =
+            routing::gate_error(ENABLED.load(Ordering::Relaxed), ARMED.load(Ordering::Relaxed))
+        {
+            return Reply::Err(code);
+        }
+    }
     // Everything except the inline config commands runs on the actuator loop.
     let routed_to_actuator = !matches!(
         cmd,
         Command::Ping | Command::Info | Command::Arm | Command::Disarm | Command::SetPacing { .. }
     );
-    if new_actuation {
-        // The hardware switch outranks the soft arm gate: while it is off,
-        // nothing actuates no matter what the host armed.
-        if !ENABLED.load(Ordering::Relaxed) {
-            return Reply::Err(ErrorCode::Disabled);
-        }
-        if !ARMED.load(Ordering::Relaxed) {
-            return Reply::Err(ErrorCode::Disarmed);
-        }
-    }
     if routed_to_actuator {
         ACT_CMD.send((caller, cmd)).await;
         return match caller {
@@ -760,8 +775,13 @@ async fn emit_mouse<'a>(
 ) {
     let mut report = [0u8; MOUSE_REPORT_LEN];
     report[0] = mouse.buttons;
-    report[1] = wheel.to_le_bytes()[0];
-    report[2] = pan.to_le_bytes()[0];
+    // For an i8 the two's-complement low byte is exactly the report byte
+    // the descriptor declares (logical -127..=127).
+    #[allow(clippy::cast_sign_loss)]
+    {
+        report[1] = wheel as u8;
+        report[2] = pan as u8;
+    }
     report[3..5].copy_from_slice(&mouse.x.to_le_bytes());
     report[5..7].copy_from_slice(&mouse.y.to_le_bytes());
     if let Err(e) = writer.write(&report).await {
@@ -791,8 +811,9 @@ mod cdc {
         dispatch,
     };
 
-    /// Worst-case reply size (line plus newline plus slack).
-    const OUT_LEN: usize = MAX_LINE_LEN + 2;
+    /// Endpoint-sized reply buffer: embassy rejects writes larger than the
+    /// endpoint (64 bytes), and replies are far shorter than that.
+    const OUT_LEN: usize = 64;
 
     /// Serves ASCII command lines until the device is unplugged.
     pub async fn run<'a>(mut class: CdcAcmClass<'a, Driver<'a, USB>>) {
