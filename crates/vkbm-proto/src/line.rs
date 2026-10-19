@@ -174,7 +174,12 @@ pub fn encode_reply<'a>(reply: &Reply, out: &'a mut [u8]) -> Result<&'a str, Enc
     let mut w = LineOut { buf: out, pos: 0 };
     let ok = match *reply {
         Reply::Ok => core::write!(w, "OK"),
-        Reply::Info { major, minor } => core::write!(w, "VKBM {major}.{minor}"),
+        Reply::Info { major, minor, flags } => core::write!(
+            w,
+            "VKBM {major}.{minor} switch={} arm={}",
+            if flags & crate::info_flags::SWITCH_ON != 0 { "on" } else { "off" },
+            if flags & crate::info_flags::ARMED != 0 { "on" } else { "off" }
+        ),
         Reply::Err(code) => core::write!(
             w,
             "ERR {}",
@@ -184,6 +189,7 @@ pub fn encode_reply<'a>(reply: &Reply, out: &'a mut [u8]) -> Result<&'a str, Enc
                 ErrorCode::Disarmed => "DISARMED",
                 ErrorCode::NotImplemented => "NOT-IMPLEMENTED",
                 ErrorCode::KeyboardFull => "KEYBOARD-FULL",
+                ErrorCode::Disabled => "DISABLED",
             }
         ),
     };
@@ -399,7 +405,21 @@ mod tests {
     fn encodes_replies() {
         let mut buf = [0u8; MAX_LINE_LEN];
         assert_eq!(encode_reply(&Reply::Ok, &mut buf), Ok("OK"));
-        assert_eq!(encode_reply(&Reply::Info { major: 0, minor: 1 }, &mut buf), Ok("VKBM 0.1"));
+        assert_eq!(
+            encode_reply(
+                &Reply::Info {
+                    major: 0,
+                    minor: 1,
+                    flags: crate::info_flags::SWITCH_ON | crate::info_flags::ARMED
+                },
+                &mut buf
+            ),
+            Ok("VKBM 0.1 switch=on arm=on")
+        );
+        assert_eq!(
+            encode_reply(&Reply::Info { major: 0, minor: 1, flags: 0 }, &mut buf),
+            Ok("VKBM 0.1 switch=off arm=off")
+        );
         assert_eq!(encode_reply(&Reply::Err(ErrorCode::Disarmed), &mut buf), Ok("ERR DISARMED"));
         assert_eq!(
             encode_reply(&Reply::Err(ErrorCode::NotImplemented), &mut buf),
@@ -409,6 +429,7 @@ mod tests {
             encode_reply(&Reply::Err(ErrorCode::KeyboardFull), &mut buf),
             Ok("ERR KEYBOARD-FULL")
         );
+        assert_eq!(encode_reply(&Reply::Err(ErrorCode::Disabled), &mut buf), Ok("ERR DISABLED"));
     }
 
     #[test]

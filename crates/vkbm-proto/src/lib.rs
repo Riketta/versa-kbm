@@ -19,6 +19,16 @@ pub mod line;
 /// logical maximum; the OS scales the range across the desktop.
 pub const ABS_MAX: u16 = 32_767;
 
+/// Bits of the [`Reply::Info`] `flags` byte.
+pub mod info_flags {
+    /// The hardware switch on the board is on: the device may actuate (the
+    /// soft arm gate permitting).
+    pub const SWITCH_ON: u8 = 0x01;
+
+    /// The soft arm gate is open ([`Command::Arm`] is in effect).
+    pub const ARMED: u8 = 0x02;
+}
+
 /// A mouse button, in absolute-mouse report bit order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Button {
@@ -137,6 +147,8 @@ pub enum Reply {
         major: u8,
         /// Semver minor.
         minor: u8,
+        /// [`info_flags`] bits: hardware switch and soft arm gate state.
+        flags: u8,
     },
 }
 
@@ -155,4 +167,8 @@ pub enum ErrorCode {
     /// Keyboard 6KRO budget already full: the usage was dropped, not
     /// latched, so the tap would have been a no-op.
     KeyboardFull,
+    /// The hardware switch on the board is off: actuation is refused until
+    /// someone toggles it back on at the device. Software cannot clear this
+    /// state - that is the point of the switch.
+    Disabled,
 }

@@ -25,9 +25,11 @@ needed.
   re-executing it.
 - Full command set: key down/up/tap, absolute and relative mouse movement,
   button down/up, move-and-click, wheel/pan scrolling, release-all, pacing.
-- Soft killswitch: `DISARM` refuses every actuation command until `ARM`;
-  board LED shows the armed state. Releases (`RELEASE`, key/button up)
-  always work, even disarmed.
+- Soft killswitch: `DISARM` refuses every actuation command until `ARM`.
+- Hardware master switch: a tap on BOOTSEL disables actuation at the device
+  itself; software cannot clear it. Switching off also releases every held
+  key and button. Releases (`RELEASE`, key/button up) always work, no
+  matter how either killswitch is set.
 - Configurable pacing between report steps (`vkbm pacing inter hold`).
 - Optional CDC-ACM bench port (`dev-cdc` feature): same commands as plain
   ASCII lines, usable from any serial terminal (CRLF tolerated).
@@ -68,7 +70,7 @@ builds (no features) enumerate as HID only.
 ```sh
 vkbm list                 # enumerate HID devices, mark the versa-kbm channel
 vkbm ping                 # handshake + round-trip latency
-vkbm info                 # firmware version
+vkbm info                 # firmware version, switch and arm gate state
 vkbm move 16384 16384     # pointer to center (coordinates are 0..=32767)
 vkbm move-rel -100 0      # pointer by a delta (anchored to the device's last position)
 vkbm press 4096 4096      # move + left-click
@@ -85,8 +87,28 @@ Global overrides: `--vid`, `--pid` (decimal or `0x`-prefixed hex),
 
 With the `dev-cdc` firmware feature you can also talk to the device from any
 serial terminal at the bench port — one command per line (`PING`, `INFO`,
-`CA 16384 16384`, `RA`, ...), replies come back as `OK`, `VKBM x.y` (for
-`INFO`), or `ERR ...` with a reason code.
+`CA 16384 16384`, `RA`, ...), replies come back as `OK`, `VKBM x.y switch=..
+arm=..` (for `INFO`), or `ERR ...` with a reason code.
+
+## Hardware kill switch (BOOTSEL)
+
+A short tap on the board's BOOTSEL button toggles the device on or off
+independently of any software:
+
+- **Off:** every actuation command is refused with `ERR DISABLED`, and any
+  held keys or buttons are released at the moment of the toggle. The host
+  can see the state (`vkbm info` prints `switch=off`) but cannot clear it.
+- **On:** the device acts normally, still subject to the soft
+  `DISARM`/`ARM` gate.
+- The board LED is solid only when the device can actuate (switch on and
+  armed); it blinks slowly whenever either gate is closed.
+- Holding BOOTSEL during power-up still enters the stock USB bootloader
+  (recovery/flashing mode); only short taps while running toggle the
+  switch.
+
+BOOTSEL is wired to the flash CS line, so firmware samples it by floating
+that line for a few microseconds from a RAM-resident routine (the pico-sdk
+recipe); USB traffic merely pauses for that instant.
 
 ## Wire protocol
 
@@ -114,9 +136,11 @@ Change the constants if your use case needs a different appearance.
 ## Security & limitations
 
 - The control channel has **no authentication**: any local process that can
-  open the device's HID interface can arm it and send commands. The
+  open the device's HID interface can arm it and send commands. The soft
   killswitch (`DISARM`) guards against accidents, not hostile local
-  software — unplug the device when that matters.
+  software — unplug the device when that matters. The BOOTSEL hardware
+  switch *does* bind hostile software (it cannot be toggled over USB), at
+  the cost of physical access to flip it back.
 - The USB identity is a fixed constant near the top of the firmware; it is
   not a guarantee of anything, only an appearance.
 - Relative movement (`move-rel`, line `MR`) is anchored to the last position
@@ -129,5 +153,6 @@ Change the constants if your use case needs a different appearance.
 
 ## Status
 
-Working: firmware actuation engine, killswitch, both control channels, host
-CLI and protocol tests. Hardware validation is in progress.
+Working: firmware actuation engine, soft and hardware killswitches, both
+control channels, host CLI and protocol tests. Hardware validation is in
+progress.

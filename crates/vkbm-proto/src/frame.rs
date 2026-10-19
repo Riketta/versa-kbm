@@ -63,6 +63,7 @@ mod tag {
     pub(super) const ERR_DISARMED: u8 = 0x03;
     pub(super) const ERR_NOT_IMPLEMENTED: u8 = 0x04;
     pub(super) const ERR_KEYBOARD_FULL: u8 = 0x05;
+    pub(super) const ERR_DISABLED: u8 = 0x06;
 }
 
 /// Encodes `cmd` into `out` under sequence number `seq`, zero-padding the
@@ -186,10 +187,11 @@ pub fn encode_reply(seq: u8, reply: &Reply, out: &mut [u8; FRAME_LEN]) {
     buf[0] = seq;
     match *reply {
         Reply::Ok => buf[1] = tag::REPLY_OK,
-        Reply::Info { major, minor } => {
+        Reply::Info { major, minor, flags } => {
             buf[1] = tag::REPLY_INFO;
             buf[2] = major;
             buf[3] = minor;
+            buf[4] = flags;
         }
         Reply::Err(code) => {
             buf[1] = tag::REPLY_ERR;
@@ -199,6 +201,7 @@ pub fn encode_reply(seq: u8, reply: &Reply, out: &mut [u8; FRAME_LEN]) {
                 ErrorCode::Disarmed => tag::ERR_DISARMED,
                 ErrorCode::NotImplemented => tag::ERR_NOT_IMPLEMENTED,
                 ErrorCode::KeyboardFull => tag::ERR_KEYBOARD_FULL,
+                ErrorCode::Disabled => tag::ERR_DISABLED,
             };
         }
     }
@@ -219,8 +222,8 @@ pub fn decode_reply(data: &[u8]) -> Result<(u8, Reply), FrameError> {
     let reply = match t {
         tag::REPLY_OK => Reply::ok_or(payload)?,
         tag::REPLY_INFO => {
-            let [major, minor] = two(payload)?;
-            Reply::Info { major, minor }
+            let [major, minor, flags] = three(payload)?;
+            Reply::Info { major, minor, flags }
         }
         tag::REPLY_ERR => {
             let code = one(payload)?;
@@ -230,6 +233,7 @@ pub fn decode_reply(data: &[u8]) -> Result<(u8, Reply), FrameError> {
                 tag::ERR_DISARMED => ErrorCode::Disarmed,
                 tag::ERR_NOT_IMPLEMENTED => ErrorCode::NotImplemented,
                 tag::ERR_KEYBOARD_FULL => ErrorCode::KeyboardFull,
+                tag::ERR_DISABLED => ErrorCode::Disabled,
                 _ => return Err(FrameError::UnknownTag),
             })
         }
@@ -258,6 +262,14 @@ fn two(payload: &[u8]) -> Result<[u8; 2], FrameError> {
     match payload {
         [a, b] => Ok([*a, *b]),
         [a, b, rest @ ..] if rest.iter().all(|&x| x == 0) => Ok([*a, *b]),
+        _ => Err(FrameError::BadPayload),
+    }
+}
+
+fn three(payload: &[u8]) -> Result<[u8; 3], FrameError> {
+    match payload {
+        [a, b, c] => Ok([*a, *b, *c]),
+        [a, b, c, rest @ ..] if rest.iter().all(|&x| x == 0) => Ok([*a, *b, *c]),
         _ => Err(FrameError::BadPayload),
     }
 }
@@ -377,12 +389,13 @@ mod tests {
     fn replies_roundtrip() {
         let samples = [
             Reply::Ok,
-            Reply::Info { major: 0, minor: 1 },
+            Reply::Info { major: 0, minor: 1, flags: crate::info_flags::SWITCH_ON },
             Reply::Err(ErrorCode::UnknownCommand),
             Reply::Err(ErrorCode::BadPayload),
             Reply::Err(ErrorCode::Disarmed),
             Reply::Err(ErrorCode::NotImplemented),
             Reply::Err(ErrorCode::KeyboardFull),
+            Reply::Err(ErrorCode::Disabled),
         ];
         for reply in samples {
             let mut buf = [0u8; FRAME_LEN];

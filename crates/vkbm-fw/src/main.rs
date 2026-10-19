@@ -12,7 +12,10 @@
 //! Both channels feed one actuator loop that owns the latched keyboard/mouse
 //! state and sequences compound commands (`KeyTap`, `ClickAbs`, `Wheel`)
 //! with the configured pacing. `Disarm` (soft killswitch) refuses actuation
-//! until `Arm`; `ReleaseAll` always works, even disarmed.
+//! until `Arm`; `ReleaseAll` always works, even disarmed. A tap on the
+//! board's BOOTSEL button is a hardware master switch that disables actuation
+//! outright - software can neither clear it nor override the release it
+//! forces.
 //!
 //! The USB identity (VID/PID and strings) is a constant near the top of
 //! `main` — see the README's "Device identity" section.
@@ -24,6 +27,7 @@ use core::sync::atomic::{
     AtomicBool,
     AtomicU8,
     Ordering,
+    compiler_fence,
 };
 
 use defmt::{
@@ -85,6 +89,7 @@ use vkbm_proto::{
         FRAME_LEN,
         FrameError,
     },
+    info_flags,
 };
 
 bind_interrupts!(struct Irqs {
@@ -198,7 +203,11 @@ const VENDOR_REPORT_DESCRIPTOR: &[u8] = &[
 ];
 
 static VENDOR_EVENTS: Channel<CriticalSectionRawMutex, [u8; FRAME_LEN], 4> = Channel::new();
+/// Soft killswitch gate: `Disarm` closes it, `Arm` reopens it.
 static ARMED: AtomicBool = AtomicBool::new(true);
+/// Hardware master switch gate: toggled by a BOOTSEL tap at the board. While
+/// off, actuation is refused and no host command can switch it back on.
+static ENABLED: AtomicBool = AtomicBool::new(true);
 static PACING_INTER_MS: AtomicU8 = AtomicU8::new(4);
 static PACING_HOLD_MS: AtomicU8 = AtomicU8::new(10);
 
@@ -210,6 +219,8 @@ enum Caller {
     /// The CDC bench line loop (only constructed in `dev-cdc` builds).
     #[allow(dead_code)]
     Cdc,
+    /// The hardware-switch task: its forced release is fire-and-forget.
+    Switch,
 }
 
 static ACT_CMD: Channel<CriticalSectionRawMutex, (Caller, Command), 8> = Channel::new();
@@ -220,6 +231,7 @@ static CDC_REPLY: Signal<CriticalSectionRawMutex, Reply> = Signal::new();
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(embassy_rp::config::Config::default());
     spawner.must_spawn(led_task(p.PIN_25));
+    spawner.must_spawn(switch_task());
     let driver = Driver::new(p.USB, Irqs);
 
     // Device identity: poses as a generic vendor 2.4 GHz combo receiver —
@@ -383,6 +395,10 @@ async fn main(spawner: Spawner) {
             match caller {
                 Caller::Vendor => VENDOR_REPLY.signal(reply),
                 Caller::Cdc => CDC_REPLY.signal(reply),
+                // The switch's forced release has no waiting caller, and
+                // signaling a reply here would desync the request/reply
+                // pairing of a real one.
+                Caller::Switch => {}
             }
         }
     };
@@ -427,18 +443,125 @@ async fn main(spawner: Spawner) {
     join(usb_fut, join(reader_fut, join(actuator_fut, logic_fut))).await;
 }
 
-/// Blinks the state of [`ARMED`] onto the board LED (high = armed).
+/// LED = "can this device actuate right now": solid while the hardware
+/// switch is on and the soft gate is armed, slow blink otherwise.
 #[embassy_executor::task]
 async fn led_task(pin: Peri<'static, PIN_25>) {
+    /// Blink half-period in 50 ms poll ticks (250 ms).
+    const BLINK_TICKS: u32 = 5;
     let mut led = Output::new(pin, Level::Low);
+    let mut tick: u32 = 0;
+    let mut blink_on = false;
     loop {
-        if ARMED.load(Ordering::Relaxed) {
+        let live = ENABLED.load(Ordering::Relaxed) && ARMED.load(Ordering::Relaxed);
+        if live {
             led.set_high();
         } else {
-            led.set_low();
+            tick = tick.wrapping_add(1);
+            if tick.is_multiple_of(BLINK_TICKS) {
+                blink_on = !blink_on;
+            }
+            if blink_on {
+                led.set_high();
+            } else {
+                led.set_low();
+            }
         }
         Timer::after_millis(50).await;
     }
+}
+
+/// Switch sampler cadence (10 ms) and required consecutive equal samples
+/// (three - a 30 ms debounce).
+const SWITCH_POLL_MS: u64 = 10;
+/// Consecutive equal samples needed to accept a new BOOTSEL level.
+const SWITCH_DEBOUNCE: u32 = 3;
+
+/// Samples BOOTSEL and toggles [`ENABLED`] on every clean press: the board
+/// button is a hardware master switch the host cannot reach. Switching off
+/// also queues a release-all so nothing stays latched behind the closed gate.
+#[embassy_executor::task]
+async fn switch_task() {
+    let mut stable = false;
+    let mut candidate = false;
+    let mut run = 0u32;
+    loop {
+        let pressed = bootsel_pressed();
+        if pressed == candidate {
+            run += 1;
+        } else {
+            candidate = pressed;
+            run = 1;
+        }
+        if run >= SWITCH_DEBOUNCE && candidate != stable {
+            stable = candidate;
+            if candidate {
+                let now_enabled = !ENABLED.load(Ordering::Relaxed);
+                ENABLED.store(now_enabled, Ordering::Relaxed);
+                if !now_enabled {
+                    ACT_CMD.send((Caller::Switch, Command::ReleaseAll)).await;
+                }
+            }
+        }
+        Timer::after_millis(SWITCH_POLL_MS).await;
+    }
+}
+
+/// Reads the BOOTSEL button: `true` while held.
+///
+/// BOOTSEL hangs off the flash CS line, which the XIP interface normally
+/// drives. Sampling follows the pico-sdk recipe (as in tinyusb's
+/// `get_bootsel_button`): mask interrupts, float the CS line through the
+/// QSPI output-enable override, let the pad settle, read the SIO QSPI input
+/// snapshot (the button pulls the line low), then re-attach the line. Every
+/// instruction inside that window must execute from RAM - a flash fetch with
+/// CS floating would stall the bus - so the sampler lives in `.data` (copied
+/// to RAM at boot) and is never inlined.
+#[inline(never)]
+fn bootsel_pressed() -> bool {
+    cortex_m::interrupt::free(|_| sample_cs_line())
+}
+
+/// Samples the flash CS line with the QSPI output-enable overridden. Must be
+/// called with interrupts masked (see [`bootsel_pressed`]): the CS line is
+/// detached for the duration, so nothing may fetch from flash meanwhile.
+#[unsafe(link_section = ".data.ram_func")]
+#[inline(never)]
+fn sample_cs_line() -> bool {
+    /// `IO_QSPI` base + `GPIO_QSPI_SS_CTRL` offset (pico-sdk `io_qspi.h`).
+    const SS_CTRL: *mut u32 = 0x4001_800C as *mut u32;
+    /// `SIO` base + `GPIO_HI_IN` offset (pico-sdk `sio.h`).
+    const GPIO_HI_IN: *const u32 = 0xD000_0008 as *const u32;
+    /// `OEOVER` field: bits 13:12; `0b10` disables the output (line floats).
+    const OEOVER_SHIFT: u32 = 12;
+    /// Peripheral-driven output enable (the reset/default state).
+    const OEOVER_NORMAL: u32 = 0b00;
+    /// Output enable forced off.
+    const OEOVER_DISABLE: u32 = 0b10;
+    /// QSPI CS is QSPI gpio 1 = bit 1 of the SIO high-bank input snapshot.
+    const CS_BIT: u32 = 1 << 1;
+
+    // The fences keep the volatile window from sliding across the caller's
+    // interrupt-mask instructions (the asm there declares `nomem`).
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: raw register pokes exactly as the pico-sdk performs them; see
+    // the function docs for why this runs with interrupts masked from RAM.
+    let pressed = unsafe {
+        let ctrl = SS_CTRL;
+        let saved = ctrl.read_volatile();
+        // Float the CS line, let the pad settle, sample, re-attach.
+        ctrl.write_volatile((saved & !(0b11 << OEOVER_SHIFT)) | (OEOVER_DISABLE << OEOVER_SHIFT));
+        for _ in 0..1000 {
+            cortex_m::asm::nop();
+        }
+        let pressed = core::ptr::read_volatile(GPIO_HI_IN) & CS_BIT == 0;
+        ctrl.write_volatile(
+            (ctrl.read_volatile() & !(0b11 << OEOVER_SHIFT)) | (OEOVER_NORMAL << OEOVER_SHIFT),
+        );
+        pressed
+    };
+    compiler_fence(Ordering::SeqCst);
+    pressed
 }
 
 /// Config commands are served inline; actuation is forwarded to the actuator
@@ -463,18 +586,39 @@ async fn dispatch(caller: Caller, cmd: Command) -> Reply {
         cmd,
         Command::Ping | Command::Info | Command::Arm | Command::Disarm | Command::SetPacing { .. }
     );
-    if new_actuation && !ARMED.load(Ordering::Relaxed) {
-        return Reply::Err(ErrorCode::Disarmed);
+    if new_actuation {
+        // The hardware switch outranks the soft arm gate: while it is off,
+        // nothing actuates no matter what the host armed.
+        if !ENABLED.load(Ordering::Relaxed) {
+            return Reply::Err(ErrorCode::Disabled);
+        }
+        if !ARMED.load(Ordering::Relaxed) {
+            return Reply::Err(ErrorCode::Disarmed);
+        }
     }
     if routed_to_actuator {
         ACT_CMD.send((caller, cmd)).await;
         return match caller {
             Caller::Vendor => VENDOR_REPLY.wait().await,
             Caller::Cdc => CDC_REPLY.wait().await,
+            // Unreachable today: switch-originated commands go straight to
+            // the actuator and never wait for a reply.
+            Caller::Switch => Reply::Ok,
         };
     }
     match cmd {
-        Command::Info => Reply::Info { major: VERSION_MAJOR, minor: VERSION_MINOR },
+        Command::Info => {
+            let switch_on = ENABLED.load(Ordering::Relaxed);
+            let armed = ARMED.load(Ordering::Relaxed);
+            let mut flags = 0u8;
+            if switch_on {
+                flags |= info_flags::SWITCH_ON;
+            }
+            if armed {
+                flags |= info_flags::ARMED;
+            }
+            Reply::Info { major: VERSION_MAJOR, minor: VERSION_MINOR, flags }
+        }
         Command::Arm => {
             ARMED.store(true, Ordering::Relaxed);
             Reply::Ok

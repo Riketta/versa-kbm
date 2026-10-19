@@ -264,9 +264,14 @@ fn ping(api: &HidApi, vid: u16, pid: u16, timeout: Duration) -> Result<()> {
 }
 
 fn info(api: &HidApi, vid: u16, pid: u16, timeout: Duration) -> Result<()> {
+    use vkbm_proto::info_flags;
     let mut client = open(api, vid, pid)?;
     match client.request(&Command::Info, timeout)? {
-        vkbm_proto::Reply::Info { major, minor } => println!("vkbm firmware v{major}.{minor}"),
+        vkbm_proto::Reply::Info { major, minor, flags } => {
+            let switch = if flags & info_flags::SWITCH_ON != 0 { "on" } else { "off" };
+            let arm = if flags & info_flags::ARMED != 0 { "on" } else { "off" };
+            println!("vkbm firmware v{major}.{minor} switch={switch} arm={arm}");
+        }
         other => bail!("unexpected reply to INFO: {other:?}"),
     }
     Ok(())
@@ -282,7 +287,14 @@ fn act(api: &HidApi, vid: u16, pid: u16, timeout: Duration, cmd: Command) -> Res
 fn request(client: &mut Client, cmd: Command, timeout: Duration) -> Result<vkbm_proto::Reply> {
     let reply = client.request(&cmd, timeout)?;
     if let vkbm_proto::Reply::Err(code) = reply {
-        bail!("device refused {cmd:?}: {code:?}");
+        let hint = match code {
+            // The only gate the host cannot clear: point at the button.
+            vkbm_proto::ErrorCode::Disabled => {
+                " (hardware switch is off: tap BOOTSEL on the board to toggle it back on)"
+            }
+            _ => "",
+        };
+        bail!("device refused {cmd:?}: {code:?}{hint}");
     }
     Ok(reply)
 }
