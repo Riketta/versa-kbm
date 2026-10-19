@@ -1,6 +1,6 @@
 [target.'cfg(all(target_arch = "arm", target_os = "none"))']
-# picotool must be on PATH; adjust here if yours lives elsewhere.
-runner = 'picotool load --update --verify --execute -t elf'
+# picotool is not on PATH here; adjust if yours moves or gets installed.
+runner = 'C:\Tools\picotool\picotool.exe load --update --verify --execute -t elf'
 
 [build]
 target = "thumbv6m-none-eabi" # Cortex-M0 and Cortex-M0+.
