@@ -38,5 +38,8 @@ directory).
 
 ## Status
 
-M1 (skeleton): composite HID enumerates, vendor ping/info works over both
-channels. See `../PLAN.md` for the milestone plan.
+M3 (actuation): both channels drive the actuator loop - keyboard (6KRO +
+modifiers), absolute mouse, wheel, compound taps/clicks with configurable
+pacing, soft killswitch (`DISARM`), `RA` release-all (works disarmed).
+Bench: `vkbm move/press/key/mouse/wheel/arm/disarm/release`.
+See `../PLAN.md` for the milestone plan.

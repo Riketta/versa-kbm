@@ -1,14 +1,18 @@
-//! versa-kbm firmware (M1 skeleton).
+//! versa-kbm firmware (M3 actuation).
 //!
 //! RP2040 composite USB device:
-//! - interface 0: HID keyboard (6KRO, report-only for now; the M3 actuator
-//!   will drive it),
+//! - interface 0: HID keyboard (6KRO, modifier-aware),
 //! - interface 1: HID **absolute mouse** (5 buttons, wheel, pan, 16-bit
 //!   X/Y over the full desktop),
 //! - interface 2: HID vendor control channel (usage page `0xFF00`) speaking
 //!   the `vkbm_proto::frame` protocol,
 //! - with the `dev-cdc` feature: a CDC-ACM bench port speaking the same
 //!   commands as `vkbm_proto::line` ASCII.
+//!
+//! Both channels feed one actuator loop that owns the latched keyboard/mouse
+//! state and sequences compound commands (`KeyTap`, `ClickAbs`, `Wheel`)
+//! with the configured pacing. `Disarm` (soft killswitch) refuses actuation
+//! until `Arm`; `ReleaseAll` always works, even disarmed.
 //!
 //! Identity strings are a placeholder until the M2 identity pass.
 
@@ -29,8 +33,16 @@ use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_futures::join::join;
 use embassy_rp::{
+    Peri,
     bind_interrupts,
-    peripherals::USB,
+    gpio::{
+        Level,
+        Output,
+    },
+    peripherals::{
+        PIN_25,
+        USB,
+    },
     usb::{
         Driver,
         InterruptHandler,
@@ -39,7 +51,9 @@ use embassy_rp::{
 use embassy_sync::{
     blocking_mutex::raw::CriticalSectionRawMutex,
     channel::Channel,
+    signal::Signal,
 };
+use embassy_time::Timer;
 use embassy_usb::{
     Builder,
     Config,
@@ -59,6 +73,8 @@ use usbd_hid::descriptor::{
     SerializedDescriptor,
 };
 use vkbm_proto::{
+    ABS_MAX,
+    Button,
     Command,
     ErrorCode,
     Reply,
@@ -76,6 +92,13 @@ bind_interrupts!(struct Irqs {
 /// Absolute-mouse report: buttons byte, wheel, pan, 16-bit X, 16-bit Y.
 const MOUSE_REPORT_LEN: usize = 7;
 
+/// Keyboard input report: modifier, reserved, 6 keycodes.
+const KEYBOARD_REPORT_LEN: usize = 8;
+
+/// u16 twin of [`KEYBOARD_REPORT_LEN`] for descriptor config fields.
+#[allow(clippy::cast_possible_truncation)] // 8 fits u16
+const KEYBOARD_REPORT_LEN_U16: u16 = KEYBOARD_REPORT_LEN as u16;
+
 /// u16 twin of [`MOUSE_REPORT_LEN`] for descriptor config fields.
 #[allow(clippy::cast_possible_truncation)] // 7 fits u16
 const MOUSE_REPORT_LEN_U16: u16 = MOUSE_REPORT_LEN as u16;
@@ -87,7 +110,7 @@ const FRAME_LEN_U16: u16 = FRAME_LEN as u16;
 /// Firmware version reported by `Info`.
 const VERSION_MAJOR: u8 = 0;
 /// Firmware version reported by `Info`.
-const VERSION_MINOR: u8 = 1;
+const VERSION_MINOR: u8 = 2;
 
 /// Absolute-mouse report descriptor: 5 buttons, wheel + AC Pan (relative
 /// ticks), and absolute 16-bit X/Y scaled by the OS across the desktop.
@@ -156,11 +179,24 @@ static ARMED: AtomicBool = AtomicBool::new(true);
 static PACING_INTER_MS: AtomicU8 = AtomicU8::new(4);
 static PACING_HOLD_MS: AtomicU8 = AtomicU8::new(10);
 
+/// Who is waiting for an actuation reply.
+#[derive(Clone, Copy)]
+enum Caller {
+    /// The vendor-frame dispatch loop.
+    Vendor,
+    /// The CDC bench line loop (only constructed in `dev-cdc` builds).
+    #[allow(dead_code)]
+    Cdc,
+}
+
+static ACT_CMD: Channel<CriticalSectionRawMutex, (Caller, Command), 8> = Channel::new();
+static VENDOR_REPLY: Signal<CriticalSectionRawMutex, Reply> = Signal::new();
+static CDC_REPLY: Signal<CriticalSectionRawMutex, Reply> = Signal::new();
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    // No tasks are spawned yet; the M3 actuator may claim the second core.
-    let _ = spawner;
     let p = embassy_rp::init(embassy_rp::config::Config::default());
+    spawner.must_spawn(led_task(p.PIN_25));
     let driver = Driver::new(p.USB, Irqs);
 
     // TODO(M2): identity pass - confirm the spoofed VID/PID and strings
@@ -196,23 +232,22 @@ async fn main(spawner: Spawner) {
         &mut control_buf,
     );
 
-    // Keyboard: report handle only; keys are sent by the M3 actuator task.
     let kb_config = HidConfig {
         report_descriptor: KeyboardReport::desc(),
         request_handler: None,
         poll_ms: 8,
-        max_packet_size: 8,
+        max_packet_size: KEYBOARD_REPORT_LEN_U16,
     };
-    let kb = HidWriter::<_, 8>::new(&mut builder, &mut kb_state, kb_config);
+    let mut kb = HidWriter::<_, KEYBOARD_REPORT_LEN>::new(&mut builder, &mut kb_state, kb_config);
 
-    // Absolute mouse: report handle only; moves are sent by the M3 actuator.
     let mouse_config = HidConfig {
         report_descriptor: MOUSE_REPORT_DESCRIPTOR,
         request_handler: None,
         poll_ms: 4,
         max_packet_size: MOUSE_REPORT_LEN_U16,
     };
-    let mouse = HidWriter::<_, MOUSE_REPORT_LEN>::new(&mut builder, &mut mouse_state, mouse_config);
+    let mut mouse =
+        HidWriter::<_, MOUSE_REPORT_LEN>::new(&mut builder, &mut mouse_state, mouse_config);
 
     // Vendor control channel: production command path.
     let vendor_config = HidConfig {
@@ -233,21 +268,98 @@ async fn main(spawner: Spawner) {
     #[cfg(feature = "dev-cdc")]
     let cdc = CdcAcmClass::new(&mut builder, &mut cdc_state, 64);
 
-    // Keep the report handles alive until the M3 actuator claims them; the
-    // interfaces are registered in the builder by `new` above.
-    let _ = &kb;
-    let _ = &mouse;
-
     let mut usb = builder.build();
     let usb_fut = usb.run();
 
     let reader_fut = vendor_reader.run(false, &mut vendor_handler);
 
+    let actuator_fut = async {
+        let mut kb_keys = KeyboardState::new();
+        let mut mouse_pos = MouseState::new();
+        loop {
+            let (caller, cmd) = ACT_CMD.receive().await;
+            let reply = match cmd {
+                Command::KeyDown { usage } => {
+                    kb_keys.down(usage);
+                    emit_kb(&mut kb, &kb_keys).await;
+                    Reply::Ok
+                }
+                Command::KeyUp { usage } => {
+                    kb_keys.up(usage);
+                    emit_kb(&mut kb, &kb_keys).await;
+                    Reply::Ok
+                }
+                Command::KeyTap { usage } => {
+                    kb_keys.down(usage);
+                    emit_kb(&mut kb, &kb_keys).await;
+                    Timer::after_millis(hold_ms()).await;
+                    kb_keys.up(usage);
+                    emit_kb(&mut kb, &kb_keys).await;
+                    Reply::Ok
+                }
+                Command::MouseMoveAbs { x, y } => {
+                    mouse_pos.move_abs(x, y);
+                    emit_mouse(&mut mouse, &mouse_pos, 0, 0).await;
+                    Reply::Ok
+                }
+                Command::MouseMoveRel { dx, dy } => {
+                    mouse_pos.move_rel(dx, dy);
+                    emit_mouse(&mut mouse, &mouse_pos, 0, 0).await;
+                    Reply::Ok
+                }
+                Command::MouseDown { button } => {
+                    mouse_pos.down(button);
+                    emit_mouse(&mut mouse, &mouse_pos, 0, 0).await;
+                    Reply::Ok
+                }
+                Command::MouseUp { button } => {
+                    mouse_pos.up(button);
+                    emit_mouse(&mut mouse, &mouse_pos, 0, 0).await;
+                    Reply::Ok
+                }
+                Command::ClickAbs { x, y } => {
+                    mouse_pos.move_abs(x, y);
+                    emit_mouse(&mut mouse, &mouse_pos, 0, 0).await;
+                    Timer::after_millis(inter_ms()).await;
+                    mouse_pos.down(Button::Left);
+                    emit_mouse(&mut mouse, &mouse_pos, 0, 0).await;
+                    Timer::after_millis(hold_ms()).await;
+                    mouse_pos.up(Button::Left);
+                    emit_mouse(&mut mouse, &mouse_pos, 0, 0).await;
+                    Reply::Ok
+                }
+                Command::Wheel { v, h } => {
+                    emit_mouse(&mut mouse, &mouse_pos, v, h).await;
+                    Timer::after_millis(inter_ms()).await;
+                    emit_mouse(&mut mouse, &mouse_pos, 0, 0).await;
+                    Reply::Ok
+                }
+                Command::ReleaseAll => {
+                    kb_keys.clear();
+                    emit_kb(&mut kb, &kb_keys).await;
+                    mouse_pos.clear();
+                    emit_mouse(&mut mouse, &mouse_pos, 0, 0).await;
+                    Reply::Ok
+                }
+                // Dispatch never routes config commands here.
+                Command::Ping
+                | Command::Info
+                | Command::Arm
+                | Command::Disarm
+                | Command::SetPacing { .. } => Reply::Ok,
+            };
+            match caller {
+                Caller::Vendor => VENDOR_REPLY.signal(reply),
+                Caller::Cdc => CDC_REPLY.signal(reply),
+            }
+        }
+    };
+
     let logic_fut = async {
         loop {
             let raw = VENDOR_EVENTS.receive().await;
             let reply = match frame::decode(&raw) {
-                Ok((_, cmd)) => handle(cmd),
+                Ok((_, cmd)) => dispatch(Caller::Vendor, cmd).await,
                 Err(FrameError::UnknownTag) => Reply::Err(ErrorCode::UnknownCommand),
                 Err(_) => Reply::Err(ErrorCode::BadPayload),
             };
@@ -262,12 +374,194 @@ async fn main(spawner: Spawner) {
     #[cfg(feature = "dev-cdc")]
     let cdc_fut = cdc::run(cdc);
 
-    info!("versa-kbm up (M1 skeleton)");
+    info!("versa-kbm up (M3 actuation)");
 
     #[cfg(feature = "dev-cdc")]
-    join(usb_fut, join(reader_fut, join(logic_fut, cdc_fut))).await;
+    join(usb_fut, join(reader_fut, join(actuator_fut, join(logic_fut, cdc_fut)))).await;
     #[cfg(not(feature = "dev-cdc"))]
-    join(usb_fut, join(reader_fut, logic_fut)).await;
+    join(usb_fut, join(reader_fut, join(actuator_fut, logic_fut))).await;
+}
+
+/// Blinks the state of [`ARMED`] onto the board LED (high = armed).
+#[embassy_executor::task]
+async fn led_task(pin: Peri<'static, PIN_25>) {
+    let mut led = Output::new(pin, Level::Low);
+    loop {
+        if ARMED.load(Ordering::Relaxed) {
+            led.set_high();
+        } else {
+            led.set_low();
+        }
+        Timer::after_millis(50).await;
+    }
+}
+
+/// Config commands are served inline; actuation is forwarded to the actuator
+/// loop and `ReleaseAll` bypasses the armed gate (safety release).
+async fn dispatch(caller: Caller, cmd: Command) -> Reply {
+    let actuation = !matches!(
+        cmd,
+        Command::Ping
+            | Command::Info
+            | Command::Arm
+            | Command::Disarm
+            | Command::ReleaseAll
+            | Command::SetPacing { .. }
+    );
+    if actuation && !ARMED.load(Ordering::Relaxed) {
+        return Reply::Err(ErrorCode::Disarmed);
+    }
+    if actuation || matches!(cmd, Command::ReleaseAll) {
+        ACT_CMD.send((caller, cmd)).await;
+        return match caller {
+            Caller::Vendor => VENDOR_REPLY.wait().await,
+            Caller::Cdc => CDC_REPLY.wait().await,
+        };
+    }
+    match cmd {
+        Command::Info => Reply::Info { major: VERSION_MAJOR, minor: VERSION_MINOR },
+        Command::Arm => {
+            ARMED.store(true, Ordering::Relaxed);
+            Reply::Ok
+        }
+        Command::Disarm => {
+            ARMED.store(false, Ordering::Relaxed);
+            Reply::Ok
+        }
+        Command::SetPacing { inter_ms, hold_ms } => {
+            PACING_INTER_MS.store(inter_ms, Ordering::Relaxed);
+            PACING_HOLD_MS.store(hold_ms, Ordering::Relaxed);
+            Reply::Ok
+        }
+        // Exhaustiveness only; `actuation`/`release` above already routed
+        // every other variant, and `Ping` is the only one that really lands
+        // here.
+        Command::Ping
+        | Command::ReleaseAll
+        | Command::KeyDown { .. }
+        | Command::KeyUp { .. }
+        | Command::KeyTap { .. }
+        | Command::MouseMoveAbs { .. }
+        | Command::MouseMoveRel { .. }
+        | Command::MouseDown { .. }
+        | Command::MouseUp { .. }
+        | Command::ClickAbs { .. }
+        | Command::Wheel { .. } => Reply::Ok,
+    }
+}
+
+/// Pacing gap between sequenced report steps.
+fn inter_ms() -> u64 {
+    u64::from(PACING_INTER_MS.load(Ordering::Relaxed))
+}
+
+/// Button-hold time for clicks and taps.
+fn hold_ms() -> u64 {
+    u64::from(PACING_HOLD_MS.load(Ordering::Relaxed))
+}
+
+/// Latched keyboard state: modifier bitmap plus up to 6 regular usages.
+struct KeyboardState {
+    modifiers: u8,
+    keycodes: [u8; 6],
+}
+
+impl KeyboardState {
+    const fn new() -> Self {
+        Self { modifiers: 0, keycodes: [0; 6] }
+    }
+
+    fn down(&mut self, usage: u8) {
+        if (0xE0..=0xE7).contains(&usage) {
+            self.modifiers |= 1u8 << u32::from(usage - 0xE0);
+        } else if !self.keycodes.contains(&usage)
+            && let Some(slot) = self.keycodes.iter_mut().find(|slot| **slot == 0)
+        {
+            // 6KRO: a full keyboard silently drops the new usage.
+            *slot = usage;
+        }
+    }
+
+    fn up(&mut self, usage: u8) {
+        if (0xE0..=0xE7).contains(&usage) {
+            self.modifiers &= !(1u8 << u32::from(usage - 0xE0));
+        } else if let Some(slot) = self.keycodes.iter_mut().find(|slot| **slot == usage) {
+            *slot = 0;
+        }
+    }
+
+    fn clear(&mut self) {
+        self.modifiers = 0;
+        self.keycodes = [0; 6];
+    }
+}
+
+/// Latched absolute-mouse state: held buttons plus the last reported
+/// position (the anchor for relative moves).
+struct MouseState {
+    buttons: u8,
+    x: u16,
+    y: u16,
+}
+
+impl MouseState {
+    const fn new() -> Self {
+        Self { buttons: 0, x: ABS_MAX / 2, y: ABS_MAX / 2 }
+    }
+
+    fn move_abs(&mut self, x: u16, y: u16) {
+        self.x = x.min(ABS_MAX);
+        self.y = y.min(ABS_MAX);
+    }
+
+    fn move_rel(&mut self, dx: i16, dy: i16) {
+        self.x = clamp_axis(i32::from(self.x) + i32::from(dx));
+        self.y = clamp_axis(i32::from(self.y) + i32::from(dy));
+    }
+
+    fn down(&mut self, button: Button) {
+        self.buttons |= 1u8 << u32::from(button as u8 - 1);
+    }
+
+    fn up(&mut self, button: Button) {
+        self.buttons &= !(1u8 << u32::from(button as u8 - 1));
+    }
+
+    fn clear(&mut self) {
+        self.buttons = 0;
+    }
+}
+
+fn clamp_axis(value: i32) -> u16 {
+    u16::try_from(value.clamp(0, i32::from(ABS_MAX))).unwrap_or(0)
+}
+
+async fn emit_kb<'a>(
+    writer: &mut HidWriter<'a, Driver<'a, USB>, KEYBOARD_REPORT_LEN>,
+    kb: &KeyboardState,
+) {
+    let report =
+        KeyboardReport { modifier: kb.modifiers, reserved: 0, leds: 0, keycodes: kb.keycodes };
+    if let Err(e) = writer.write_serialize(&report).await {
+        warn!("keyboard report failed: {:?}", e);
+    }
+}
+
+async fn emit_mouse<'a>(
+    writer: &mut HidWriter<'a, Driver<'a, USB>, MOUSE_REPORT_LEN>,
+    mouse: &MouseState,
+    wheel: i8,
+    pan: i8,
+) {
+    let mut report = [0u8; MOUSE_REPORT_LEN];
+    report[0] = mouse.buttons;
+    report[1] = wheel.to_le_bytes()[0];
+    report[2] = pan.to_le_bytes()[0];
+    report[3..5].copy_from_slice(&mouse.x.to_le_bytes());
+    report[5..7].copy_from_slice(&mouse.y.to_le_bytes());
+    if let Err(e) = writer.write(&report).await {
+        warn!("mouse report failed: {:?}", e);
+    }
 }
 
 /// The USB interrupt handler task for CDC-ACM (`dev-cdc` builds).
@@ -287,8 +581,9 @@ mod cdc {
     };
 
     use super::{
+        Caller,
         USB,
-        handle,
+        dispatch,
     };
 
     /// Worst-case reply size (line plus newline plus slack).
@@ -318,7 +613,9 @@ mod cdc {
                         } else {
                             let (used, _) = line.split_at(len);
                             match line::decode(used) {
-                                Ok(cmd) => respond(&mut class, &handle(cmd)).await,
+                                Ok(cmd) => {
+                                    respond(&mut class, &dispatch(Caller::Cdc, cmd).await).await;
+                                }
                                 Err(LineError::Empty) => {}
                                 Err(_) => {
                                     respond(&mut class, &Reply::Err(ErrorCode::BadPayload)).await;
@@ -358,53 +655,6 @@ mod cdc {
         if let Err(e) = class.write_packet(head).await {
             warn!("cdc write failed: {:?}", e);
         }
-    }
-}
-
-/// Dispatches one decoded command to the shared M1 logic. Actuation commands
-/// are recognized but refused (`NotImplemented`) until the M3 actuator lands.
-fn handle(cmd: Command) -> Reply {
-    let actuation = !matches!(
-        cmd,
-        Command::Ping
-            | Command::Info
-            | Command::Arm
-            | Command::Disarm
-            | Command::ReleaseAll
-            | Command::SetPacing { .. }
-    );
-    if actuation && !ARMED.load(Ordering::Relaxed) {
-        return Reply::Err(ErrorCode::Disarmed);
-    }
-    match cmd {
-        // `ReleaseAll` is a no-op until the M3 actuator gives it something to
-        // release; the arms will split when it grows its own reply path.
-        Command::Ping | Command::ReleaseAll => Reply::Ok,
-        Command::Info => Reply::Info { major: VERSION_MAJOR, minor: VERSION_MINOR },
-        Command::Arm => {
-            ARMED.store(true, Ordering::Relaxed);
-            Reply::Ok
-        }
-        Command::Disarm => {
-            ARMED.store(false, Ordering::Relaxed);
-            Reply::Ok
-        }
-        Command::SetPacing { inter_ms, hold_ms } => {
-            PACING_INTER_MS.store(inter_ms, Ordering::Relaxed);
-            PACING_HOLD_MS.store(hold_ms, Ordering::Relaxed);
-            Reply::Ok
-        }
-        // M3: the actuator consumes these; `MouseMoveAbs`/`ClickAbs` clamp
-        // coordinates to `vkbm_proto::ABS_MAX` at the report boundary.
-        Command::KeyDown { .. }
-        | Command::KeyUp { .. }
-        | Command::KeyTap { .. }
-        | Command::MouseMoveAbs { .. }
-        | Command::MouseMoveRel { .. }
-        | Command::MouseDown { .. }
-        | Command::MouseUp { .. }
-        | Command::ClickAbs { .. }
-        | Command::Wheel { .. } => Reply::Err(ErrorCode::NotImplemented),
     }
 }
 
