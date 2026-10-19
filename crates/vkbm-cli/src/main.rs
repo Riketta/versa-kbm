@@ -17,6 +17,7 @@ use clap::{
 };
 use hidapi::HidApi;
 use vkbm_cli::{
+    ACK_TIMEOUT_MS,
     Client,
     DEFAULT_PID,
     DEFAULT_VID,
@@ -34,15 +35,25 @@ use vkbm_proto::{
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
-    /// USB vendor id override.
-    #[arg(long, global = true, default_value_t = DEFAULT_VID)]
+    /// USB vendor id override (decimal, or hex with a 0x prefix).
+    #[arg(long, global = true, default_value_t = DEFAULT_VID, value_parser = usb_id)]
     vid: u16,
-    /// USB product id override.
-    #[arg(long, global = true, default_value_t = DEFAULT_PID)]
+    /// USB product id override (decimal, or hex with a 0x prefix).
+    #[arg(long, global = true, default_value_t = DEFAULT_PID, value_parser = usb_id)]
     pid: u16,
     /// Ack timeout override, in milliseconds.
-    #[arg(long, global = true, default_value_t = 250)]
+    #[arg(long, global = true, default_value_t = ACK_TIMEOUT_MS)]
     timeout_ms: u64,
+}
+
+/// Parses a USB id: decimal, or hex with a `0x` prefix (`0x258a`).
+fn usb_id(s: &str) -> Result<u16, String> {
+    let parsed = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u16::from_str_radix(hex, 16)
+    } else {
+        s.parse::<u16>()
+    };
+    parsed.map_err(|_| format!("invalid USB id {s:?} (decimal, or hex with a 0x prefix)"))
 }
 
 #[derive(Subcommand)]
@@ -59,6 +70,15 @@ enum Cmd {
         x: u16,
         /// Absolute Y.
         y: u16,
+    },
+    /// Move the pointer by a relative delta. Relative moves are anchored to
+    /// the last position the device itself reported - another pointer on the
+    /// target machine can make them land elsewhere; prefer absolute moves.
+    MoveRel {
+        /// Signed X delta.
+        dx: i16,
+        /// Signed Y delta.
+        dy: i16,
     },
     /// Move to an absolute position and left-click it.
     Press {
@@ -99,6 +119,16 @@ enum Cmd {
     Disarm,
     /// Release every held key and button.
     Release,
+    /// Set actuation pacing: gap between sequenced report steps and
+    /// button-hold time, in milliseconds. High values make paced commands
+    /// (`press`, `key`, `wheel`) outlive the ack timeout; the device dedups
+    /// resends, but raise `--timeout-ms` to match if you raise pacing.
+    Pacing {
+        /// Gap between sequenced report steps, in milliseconds.
+        inter_ms: u8,
+        /// Button-hold time for clicks and taps, in milliseconds.
+        hold_ms: u8,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -146,6 +176,9 @@ fn main() -> Result<()> {
         Cmd::Ping => ping(&api, cli.vid, cli.pid, timeout),
         Cmd::Info => info(&api, cli.vid, cli.pid, timeout),
         Cmd::Move { x, y } => act(&api, cli.vid, cli.pid, timeout, Command::MouseMoveAbs { x, y }),
+        Cmd::MoveRel { dx, dy } => {
+            act(&api, cli.vid, cli.pid, timeout, Command::MouseMoveRel { dx, dy })
+        }
         Cmd::Press { x, y } => act(&api, cli.vid, cli.pid, timeout, Command::ClickAbs { x, y }),
         Cmd::Key { usage, down, up } => {
             let cmd = if down {
@@ -164,10 +197,19 @@ fn main() -> Result<()> {
                 MouseAction::Up => Command::MouseUp { button },
                 MouseAction::Click => {
                     let mut client = open(&api, cli.vid, cli.pid)?;
-                    request(&mut client, Command::MouseDown { button }, timeout)?;
-                    std::thread::sleep(Duration::from_millis(25));
-                    request(&mut client, Command::MouseUp { button }, timeout)?;
-                    return Ok(());
+                    let clicked = (|| -> Result<()> {
+                        request(&mut client, Command::MouseDown { button }, timeout)?;
+                        std::thread::sleep(Duration::from_millis(CLICK_HOLD_MS));
+                        request(&mut client, Command::MouseUp { button }, timeout)?;
+                        Ok(())
+                    })();
+                    if clicked.is_err() {
+                        // Never leave a button latched on the target: the
+                        // device keeps key/mouse state until released.
+                        let _ = client.request(&Command::ReleaseAll, timeout);
+                        eprintln!("click failed; sent release-all as a safety net");
+                    }
+                    return clicked;
                 }
             };
             act(&api, cli.vid, cli.pid, timeout, cmd)
@@ -178,8 +220,15 @@ fn main() -> Result<()> {
         Cmd::Arm => act(&api, cli.vid, cli.pid, timeout, Command::Arm),
         Cmd::Disarm => act(&api, cli.vid, cli.pid, timeout, Command::Disarm),
         Cmd::Release => act(&api, cli.vid, cli.pid, timeout, Command::ReleaseAll),
+        Cmd::Pacing { inter_ms, hold_ms } => {
+            act(&api, cli.vid, cli.pid, timeout, Command::SetPacing { inter_ms, hold_ms })
+        }
     }
 }
+
+/// Host-side button-hold time for `mouse click` (device pacing applies to
+/// `press`/`key`; this two-step click is paced here).
+const CLICK_HOLD_MS: u64 = 25;
 
 /// Enumerates HID devices. Infallible today, but kept `Result` so every
 /// subcommand keeps the same dispatch shape in `main`.

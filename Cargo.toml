@@ -2,7 +2,7 @@
 resolver = "3"
 members = ["crates/vkbm-proto", "crates/vkbm-cli"]
 # The firmware is a standalone crate (own toolchain target, own lockfile,
-# own target dir) like the versa-kbm template it evolved from.
+# own target dir), excluded from the workspace.
 exclude = ["crates/vkbm-fw"]
 
 [workspace.package]

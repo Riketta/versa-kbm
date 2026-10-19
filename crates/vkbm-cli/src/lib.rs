@@ -29,8 +29,11 @@ pub const VENDOR_USAGE_PAGE: u16 = 0xff00;
 /// Vendor control channel usage, from the firmware report descriptor.
 pub const VENDOR_USAGE: u16 = 0x01;
 
+/// Default ack timeout, in milliseconds (the CLI's `--timeout-ms` default).
+pub const ACK_TIMEOUT_MS: u64 = 250;
+
 /// How long one ack may take before the attempt counts as lost.
-pub const ACK_TIMEOUT: Duration = Duration::from_millis(250);
+pub const ACK_TIMEOUT: Duration = Duration::from_millis(ACK_TIMEOUT_MS);
 
 /// Client failures.
 #[derive(Debug)]
@@ -48,10 +51,9 @@ pub enum Error {
         /// Bytes of the full report.
         want: usize,
     },
-    /// No ack within the timeout, even after the single resend.
+    /// No ack within the timeout (or the reply stream stayed junk), even
+    /// after the single resend.
     Timeout,
-    /// A reply arrived but could not be decoded.
-    Decode(frame::FrameError),
     /// No device with the vendor control channel was found.
     NotFound,
 }
@@ -66,7 +68,6 @@ impl core::fmt::Display for Error {
                 write!(f, "short write: {wrote} of {want} bytes accepted")
             }
             Self::Timeout => write!(f, "no ack within the timeout"),
-            Self::Decode(e) => write!(f, "undecodable reply: {e}"),
             Self::NotFound => write!(f, "no versa-kbm vendor control channel found"),
         }
     }
@@ -76,7 +77,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Open(e) | Self::Write(e) | Self::Read(e) => Some(e),
-            Self::ShortWrite { .. } | Self::Timeout | Self::Decode(_) | Self::NotFound => None,
+            Self::ShortWrite { .. } | Self::Timeout | Self::NotFound => None,
         }
     }
 }
@@ -151,10 +152,12 @@ impl Client {
     }
 
     /// Sends one command and waits for its ack; a lost ack is resent once.
+    /// Stale and undecodable replies are discarded (bounded; see
+    /// [`wait_ack`]).
     ///
     /// # Errors
     /// [`Error::Timeout`] after send plus one resend, transport errors from
-    /// [`Error`], decode errors for malformed replies.
+    /// [`Error`].
     pub fn request(&mut self, cmd: &Command, timeout: Duration) -> Result<Reply, Error> {
         let seq = self.next_seq;
         self.next_seq = if seq == u8::MAX { 1 } else { seq + 1 };
@@ -183,14 +186,32 @@ fn issue(
     Err(Error::Timeout)
 }
 
+/// Waits for the ack of one attempt.
+///
+/// One deadline spans the whole wait: stale replies (for an earlier,
+/// timed-out request) must not extend it, and a stream of stale or
+/// undecodable frames is capped instead of looping forever.
 fn wait_ack(link: &mut dyn Link, seq: u8, timeout: Duration) -> Result<Reply, Error> {
+    /// How many junk frames one attempt tolerates before declaring the
+    /// attempt lost.
+    const MAX_JUNK: u32 = 8;
+    let deadline = std::time::Instant::now() + timeout;
+    let mut junk = 0u32;
     loop {
-        let raw = link.recv(timeout)?;
-        let (got, reply) = frame::decode_reply(&raw).map_err(Error::Decode)?;
-        if got == seq {
-            return Ok(reply);
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Err(Error::Timeout);
         }
-        // A reply for an earlier (timed-out) request: discard it.
+        let raw = link.recv(deadline - now)?;
+        match frame::decode_reply(&raw) {
+            Ok((got, reply)) if got == seq => return Ok(reply),
+            // Stale (an earlier request's ack) or undecodable: tolerate a
+            // bounded number, then declare the attempt lost.
+            _ => junk += 1,
+        }
+        if junk >= MAX_JUNK {
+            return Err(Error::Timeout);
+        }
     }
 }
 
@@ -314,6 +335,33 @@ mod tests {
     }
 
     #[test]
+    fn undecodable_reply_is_tolerated_then_the_ack_found() {
+        let mut junk = [0u8; FRAME_LEN];
+        junk[1] = 0x7F; // unknown reply tag
+        let mut link = FakeLink {
+            replies: Rc::new(RefCell::new(std::collections::VecDeque::from([
+                Ok(junk),
+                Ok(ack_for(1)),
+            ]))),
+            ..FakeLink::default()
+        };
+        let reply = issue(&mut link, &frame_for(1), 1, TIMEOUT);
+        assert!(matches!(reply, Ok(Reply::Ok)), "one junk frame must not fail the request");
+        assert_eq!(link.sent(), 1);
+    }
+
+    #[test]
+    fn junk_reply_flood_times_out_instead_of_looping() {
+        // More stale frames than one attempt can tolerate, for both
+        // attempts: the request must end instead of waiting forever.
+        let flood: std::collections::VecDeque<_> = (0..32).map(|_| Ok(ack_for(9))).collect();
+        let mut link = FakeLink { replies: Rc::new(RefCell::new(flood)), ..FakeLink::default() };
+        let reply = issue(&mut link, &frame_for(1), 1, TIMEOUT);
+        assert!(matches!(reply, Err(Error::Timeout)));
+        assert_eq!(link.sent(), 2, "the resend still happens once, then give up");
+    }
+
+    #[test]
     fn client_advances_sequence_numbers() {
         let fake = FakeLink {
             replies: Rc::new(RefCell::new(std::collections::VecDeque::from([
@@ -327,5 +375,21 @@ mod tests {
         let _ = client.request(&Command::Info, TIMEOUT);
         assert_eq!(fake.sent_seq(0), Some(1));
         assert_eq!(fake.sent_seq(1), Some(2));
+    }
+
+    #[test]
+    fn client_wraps_sequence_numbers_past_u8_max() {
+        let fake = FakeLink {
+            replies: Rc::new(RefCell::new(std::collections::VecDeque::from([
+                Ok(ack_for(u8::MAX)),
+                Ok(ack_for(1)),
+            ]))),
+            ..FakeLink::default()
+        };
+        let mut client = super::Client { link: Box::new(fake.clone()), next_seq: u8::MAX };
+        let _ = client.request(&Command::Ping, TIMEOUT);
+        let _ = client.request(&Command::Ping, TIMEOUT);
+        assert_eq!(fake.sent_seq(0), Some(u8::MAX));
+        assert_eq!(fake.sent_seq(1), Some(1), "seq wraps MAX -> 1");
     }
 }

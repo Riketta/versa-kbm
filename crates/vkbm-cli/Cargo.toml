@@ -1,6 +1,6 @@
 [package]
 name = "vkbm-cli"
-description = "versa-kbm companion CLI: find the device, handshake, manual actuation, calibration."
+description = "versa-kbm companion CLI: find the device, handshake, manual actuation."
 version.workspace = true
 edition.workspace = true
 publish = false

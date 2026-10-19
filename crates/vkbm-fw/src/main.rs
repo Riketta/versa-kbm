@@ -79,6 +79,7 @@ use vkbm_proto::{
     Command,
     ErrorCode,
     Reply,
+    dedup::SeqDedup,
     frame::{
         self,
         FRAME_LEN,
@@ -108,10 +109,31 @@ const MOUSE_REPORT_LEN_U16: u16 = MOUSE_REPORT_LEN as u16;
 #[allow(clippy::cast_possible_truncation)] // 64 fits u16
 const FRAME_LEN_U16: u16 = FRAME_LEN as u16;
 
-/// Firmware version reported by `Info`.
-const VERSION_MAJOR: u8 = 0;
-/// Firmware version reported by `Info`.
-const VERSION_MINOR: u8 = 2;
+/// First digit of a version part (`b"2"` -> 2). Single-digit parts expected
+/// pre-1.0; anything longer contributes its leading digit.
+const fn leading_digit(bytes: &[u8]) -> u8 {
+    match bytes.split_first() {
+        Some((&b, _)) if b.is_ascii_digit() => b - b'0',
+        _ => 0,
+    }
+}
+
+/// Firmware version reported by `Info`, derived from the crate version so
+/// the two cannot drift (`"0.2.0"` -> major 0, minor 2).
+const VERSION_MAJOR: u8 = leading_digit(env!("CARGO_PKG_VERSION").as_bytes());
+/// Firmware minor version (see [`VERSION_MAJOR`]).
+const VERSION_MINOR: u8 = version_minor(env!("CARGO_PKG_VERSION").as_bytes());
+
+/// The leading digit after the first `.` of a version string.
+const fn version_minor(mut bytes: &'static [u8]) -> u8 {
+    while let Some((&b, rest)) = bytes.split_first() {
+        if b == b'.' {
+            return leading_digit(rest);
+        }
+        bytes = rest;
+    }
+    0
+}
 
 /// Absolute-mouse report descriptor: 5 buttons, wheel + AC Pan (relative
 /// ticks), and absolute 16-bit X/Y scaled by the OS across the desktop.
@@ -282,9 +304,14 @@ async fn main(spawner: Spawner) {
             let (caller, cmd) = ACT_CMD.receive().await;
             let reply = match cmd {
                 Command::KeyDown { usage } => {
-                    kb_keys.down(usage);
-                    emit_kb(&mut kb, &kb_keys).await;
-                    Reply::Ok
+                    if kb_keys.down(usage) {
+                        emit_kb(&mut kb, &kb_keys).await;
+                        Reply::Ok
+                    } else {
+                        // Dropped, not latched: report it instead of acking
+                        // a tap that would never happen.
+                        Reply::Err(ErrorCode::KeyboardFull)
+                    }
                 }
                 Command::KeyUp { usage } => {
                     kb_keys.up(usage);
@@ -292,12 +319,15 @@ async fn main(spawner: Spawner) {
                     Reply::Ok
                 }
                 Command::KeyTap { usage } => {
-                    kb_keys.down(usage);
-                    emit_kb(&mut kb, &kb_keys).await;
-                    Timer::after_millis(hold_ms()).await;
-                    kb_keys.up(usage);
-                    emit_kb(&mut kb, &kb_keys).await;
-                    Reply::Ok
+                    if kb_keys.down(usage) {
+                        emit_kb(&mut kb, &kb_keys).await;
+                        Timer::after_millis(hold_ms()).await;
+                        kb_keys.up(usage);
+                        emit_kb(&mut kb, &kb_keys).await;
+                        Reply::Ok
+                    } else {
+                        Reply::Err(ErrorCode::KeyboardFull)
+                    }
                 }
                 Command::MouseMoveAbs { x, y } => {
                     mouse_pos.move_abs(x, y);
@@ -358,10 +388,23 @@ async fn main(spawner: Spawner) {
     };
 
     let logic_fut = async {
+        // Duplicate suppression for the host's one-resend policy: the device
+        // acks after execution, so a paced command can outlive the host's
+        // ack timeout and the resend must replay the cached reply instead of
+        // executing twice (double tap, double click).
+        let mut dedup = SeqDedup::new();
         loop {
             let raw = VENDOR_EVENTS.receive().await;
             let reply = match frame::decode(&raw) {
-                Ok((_, cmd)) => dispatch(Caller::Vendor, cmd).await,
+                Ok((seq, cmd)) => {
+                    if let Some(cached) = dedup.replay(seq) {
+                        cached
+                    } else {
+                        let reply = dispatch(Caller::Vendor, cmd).await;
+                        dedup.remember(seq, reply);
+                        reply
+                    }
+                }
                 Err(FrameError::UnknownTag) => Reply::Err(ErrorCode::UnknownCommand),
                 Err(_) => Reply::Err(ErrorCode::BadPayload),
             };
@@ -401,19 +444,29 @@ async fn led_task(pin: Peri<'static, PIN_25>) {
 /// Config commands are served inline; actuation is forwarded to the actuator
 /// loop and `ReleaseAll` bypasses the armed gate (safety release).
 async fn dispatch(caller: Caller, cmd: Command) -> Reply {
-    let actuation = !matches!(
+    // Commands that may be refused while disarmed: everything that causes
+    // NEW actuation. Pure releases and the config/queries always work - you
+    // must be able to let go of a held key without arming first.
+    let new_actuation = !matches!(
         cmd,
         Command::Ping
             | Command::Info
             | Command::Arm
             | Command::Disarm
             | Command::ReleaseAll
+            | Command::KeyUp { .. }
+            | Command::MouseUp { .. }
             | Command::SetPacing { .. }
     );
-    if actuation && !ARMED.load(Ordering::Relaxed) {
+    // Everything except the inline config commands runs on the actuator loop.
+    let routed_to_actuator = !matches!(
+        cmd,
+        Command::Ping | Command::Info | Command::Arm | Command::Disarm | Command::SetPacing { .. }
+    );
+    if new_actuation && !ARMED.load(Ordering::Relaxed) {
         return Reply::Err(ErrorCode::Disarmed);
     }
-    if actuation || matches!(cmd, Command::ReleaseAll) {
+    if routed_to_actuator {
         ACT_CMD.send((caller, cmd)).await;
         return match caller {
             Caller::Vendor => VENDOR_REPLY.wait().await,
@@ -435,9 +488,9 @@ async fn dispatch(caller: Caller, cmd: Command) -> Reply {
             PACING_HOLD_MS.store(hold_ms, Ordering::Relaxed);
             Reply::Ok
         }
-        // Exhaustiveness only; `actuation`/`release` above already routed
-        // every other variant, and `Ping` is the only one that really lands
-        // here.
+        // Exhaustiveness only; routing above already sent every other
+        // variant to the actuator, and `Ping` is the only one that really
+        // lands here.
         Command::Ping
         | Command::ReleaseAll
         | Command::KeyDown { .. }
@@ -473,14 +526,20 @@ impl KeyboardState {
         Self { modifiers: 0, keycodes: [0; 6] }
     }
 
-    fn down(&mut self, usage: u8) {
+    /// Latches a usage down; `false` when the 6KRO budget is already full
+    /// and the usage was dropped (the caller reports
+    /// [`ErrorCode::KeyboardFull`] instead of acking).
+    fn down(&mut self, usage: u8) -> bool {
         if (0xE0..=0xE7).contains(&usage) {
             self.modifiers |= 1u8 << u32::from(usage - 0xE0);
-        } else if !self.keycodes.contains(&usage)
-            && let Some(slot) = self.keycodes.iter_mut().find(|slot| **slot == 0)
-        {
-            // 6KRO: a full keyboard silently drops the new usage.
+            true
+        } else if self.keycodes.contains(&usage) {
+            true
+        } else if let Some(slot) = self.keycodes.iter_mut().find(|slot| **slot == 0) {
             *slot = usage;
+            true
+        } else {
+            false
         }
     }
 
@@ -641,7 +700,7 @@ mod cdc {
         let mut out = [0u8; OUT_LEN];
         // encode_reply cannot overflow OUT_LEN for any reply; the fallback
         // only exists so the failure path stays honest.
-        let len = if let Ok(s) = line::encode_reply(reply, &mut out) {
+        let mut len = if let Ok(s) = line::encode_reply(reply, &mut out) {
             s.len()
         } else {
             let fallback = b"ERR BAD-PAYLOAD";
@@ -650,6 +709,9 @@ mod cdc {
             }
             fallback.len()
         };
+        // Clamp before reserving the newline slot so both slices below are
+        // in bounds by construction, not by assumption.
+        len = len.min(OUT_LEN - 1);
         if let Some(slot) = out.get_mut(len) {
             *slot = b'\n';
         }

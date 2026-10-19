@@ -20,14 +20,17 @@ needed.
 - Composite HID: keyboard (6-key rollover + modifiers) and absolute mouse
   (5 buttons, wheel, horizontal pan).
 - Control channel: HID vendor usage page `0xFF00`, 64-byte binary frames,
-  acked with sequence numbers; one automatic resend on a lost ack.
+  acked with sequence numbers; one automatic resend on a lost ack, and the
+  device replays the cached reply for a resent sequence instead of
+  re-executing it.
 - Full command set: key down/up/tap, absolute and relative mouse movement,
-  button down/up, move-and-click, wheel/pan scrolling, release-all.
+  button down/up, move-and-click, wheel/pan scrolling, release-all, pacing.
 - Soft killswitch: `DISARM` refuses every actuation command until `ARM`;
-  board LED shows the armed state. `RELEASE` always works, even disarmed.
-- Configurable pacing between report steps (human-plausible timing).
+  board LED shows the armed state. Releases (`RELEASE`, key/button up)
+  always work, even disarmed.
+- Configurable pacing between report steps (`vkbm pacing inter hold`).
 - Optional CDC-ACM bench port (`dev-cdc` feature): same commands as plain
-  ASCII lines, usable from any serial terminal.
+  ASCII lines, usable from any serial terminal (CRLF tolerated).
 
 ## Repository layout
 
@@ -47,7 +50,8 @@ cargo test                            # protocol + client tests
 ```
 
 Firmware (`thumbv6m-none-eabi` target required: `rustup target add
-thumbv6m-none-eabi`; picotool on PATH for flashing):
+thumbv6m-none-eabi`; `picotool` must be on your PATH for flashing — adjust
+`crates/vkbm-fw/.cargo/config.toml` if yours lives elsewhere):
 
 ```sh
 cd crates/vkbm-fw
@@ -66,19 +70,23 @@ vkbm list                 # enumerate HID devices, mark the versa-kbm channel
 vkbm ping                 # handshake + round-trip latency
 vkbm info                 # firmware version
 vkbm move 16384 16384     # pointer to center (coordinates are 0..=32767)
+vkbm move-rel -100 0      # pointer by a delta (anchored to the device's last position)
 vkbm press 4096 4096      # move + left-click
 vkbm key 44               # tap space (HID usage code; 41 = ESC)
 vkbm mouse click right    # click a button at the current position
 vkbm wheel 3              # scroll up; horizontal: vkbm wheel 0 -3
+vkbm pacing 4 10          # step gap / button hold, in milliseconds
 vkbm disarm               # killswitch: actuation refused until...
 vkbm arm                  # ...re-armed (vkbm release lets go of everything)
 ```
 
-Global overrides: `--vid`, `--pid`, `--timeout-ms`.
+Global overrides: `--vid`, `--pid` (decimal or `0x`-prefixed hex),
+`--timeout-ms`.
 
 With the `dev-cdc` firmware feature you can also talk to the device from any
 serial terminal at the bench port — one command per line (`PING`, `INFO`,
-`CA 16384 16384`, `RA`, ...), replies come back as `OK` / `ERR ...`.
+`CA 16384 16384`, `RA`, ...), replies come back as `OK`, `VKBM x.y` (for
+`INFO`), or `ERR ...` with a reason code.
 
 ## Wire protocol
 
@@ -88,6 +96,12 @@ tag, little-endian payload, zero padding — see `crates/vkbm-proto/src/frame.rs
 for the tag table and `src/line.rs` for the ASCII encoding. Both encodings are
 generated from one command vocabulary and covered by shared tests.
 
+The device deduplicates by sequence number: because it acks *after*
+execution, a paced command can outlive the host's ack timeout, and the
+automatic resend would otherwise execute twice. A repeated sequence replays
+the cached reply instead. If you raise pacing above the ack timeout
+(`--timeout-ms`, default 250), raise the timeout with it.
+
 ## Device identity
 
 The USB identity (VID/PID and strings) is defined by constants near the top
@@ -96,6 +110,22 @@ By default the device poses as a generic 2.4 GHz wireless receiver
 (`258a:0100`, "2.4G Wireless Receiver", no manufacturer string) — the kind
 of anonymous combo dongle that ships with cheap keyboard/mouse sets.
 Change the constants if your use case needs a different appearance.
+
+## Security & limitations
+
+- The control channel has **no authentication**: any local process that can
+  open the device's HID interface can arm it and send commands. The
+  killswitch (`DISARM`) guards against accidents, not hostile local
+  software — unplug the device when that matters.
+- The USB identity is a fixed constant near the top of the firmware; it is
+  not a guarantee of anything, only an appearance.
+- Relative movement (`move-rel`, line `MR`) is anchored to the last position
+  the device itself reported, not the OS cursor; another pointer on the
+  target machine makes it land elsewhere. Prefer absolute moves.
+- A key or button held across a failed command stays latched;
+  `vkbm release` (line `RA`) always clears everything, even disarmed.
+- Keyboard LED output reports (caps/num-lock state from the host) are not
+  consumed; the virtual keyboard does not mirror them.
 
 ## Status
 

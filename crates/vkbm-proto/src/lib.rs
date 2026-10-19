@@ -11,6 +11,7 @@
 
 #![no_std]
 
+pub mod dedup;
 pub mod frame;
 pub mod line;
 
@@ -151,4 +152,7 @@ pub enum ErrorCode {
     Disarmed,
     /// Command recognized but not wired into this firmware build yet.
     NotImplemented,
+    /// Keyboard 6KRO budget already full: the usage was dropped, not
+    /// latched, so the tap would have been a no-op.
+    KeyboardFull,
 }

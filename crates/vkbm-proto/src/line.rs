@@ -67,6 +67,11 @@ impl core::fmt::Display for EncodeError {
 /// [`LineError::Empty`] for a blank line, [`LineError::TooLong`] beyond
 /// [`MAX_LINE_LEN`], and the argument errors listed on [`LineError`].
 pub fn decode(line: &[u8]) -> Result<Command, LineError> {
+    // CRLF terminals: strip trailing carriage returns before parsing.
+    let mut line = line;
+    while let Some((&b'\r', rest)) = line.split_last() {
+        line = rest;
+    }
     if line.len() > MAX_LINE_LEN {
         return Err(LineError::TooLong);
     }
@@ -178,6 +183,7 @@ pub fn encode_reply<'a>(reply: &Reply, out: &'a mut [u8]) -> Result<&'a str, Enc
                 ErrorCode::BadPayload => "BAD-PAYLOAD",
                 ErrorCode::Disarmed => "DISARMED",
                 ErrorCode::NotImplemented => "NOT-IMPLEMENTED",
+                ErrorCode::KeyboardFull => "KEYBOARD-FULL",
             }
         ),
     };
@@ -322,6 +328,15 @@ mod tests {
     }
 
     #[test]
+    fn decodes_crlf_terminated_lines() {
+        // Serial terminals commonly send CR LF; the firmware strips the LF
+        // and the decoder must tolerate the leftover CR.
+        assert_eq!(decode(b"PING\r"), Ok(Command::Ping));
+        assert_eq!(decode(b"MD left\r"), Ok(Command::MouseDown { button: Button::Left }));
+        assert_eq!(decode(b"CA 1 2\r\r"), Ok(Command::ClickAbs { x: 1, y: 2 }));
+    }
+
+    #[test]
     fn decodes_arguments() {
         assert_eq!(decode(b"KD 41"), Ok(Command::KeyDown { usage: 41 }));
         assert_eq!(decode(b"KU 224"), Ok(Command::KeyUp { usage: 224 }));
@@ -390,6 +405,20 @@ mod tests {
             encode_reply(&Reply::Err(ErrorCode::NotImplemented), &mut buf),
             Ok("ERR NOT-IMPLEMENTED")
         );
+        assert_eq!(
+            encode_reply(&Reply::Err(ErrorCode::KeyboardFull), &mut buf),
+            Ok("ERR KEYBOARD-FULL")
+        );
+    }
+
+    #[test]
+    fn exactly_max_line_len_is_accepted() {
+        // Boundary: MAX_LINE_LEN itself is fine, only longer is rejected.
+        // `RA` plus padding spaces stays a valid single-word command.
+        let mut line = [b' '; MAX_LINE_LEN];
+        let (head, _) = line.split_at_mut(2);
+        head.copy_from_slice(b"RA");
+        assert_eq!(decode(&line), Ok(Command::ReleaseAll));
     }
 
     #[test]
