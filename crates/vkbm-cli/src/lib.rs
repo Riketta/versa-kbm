@@ -21,9 +21,9 @@ use vkbm_proto::{
 };
 
 /// Default USB identity to look for (must match the firmware's constants).
-pub const DEFAULT_VID: u16 = 0x046d;
+pub const DEFAULT_VID: u16 = 0x258a;
 /// Default USB identity to look for (must match the firmware's constants).
-pub const DEFAULT_PID: u16 = 0xc52b;
+pub const DEFAULT_PID: u16 = 0x0100;
 /// Vendor control channel usage page, from the firmware report descriptor.
 pub const VENDOR_USAGE_PAGE: u16 = 0xff00;
 /// Vendor control channel usage, from the firmware report descriptor.

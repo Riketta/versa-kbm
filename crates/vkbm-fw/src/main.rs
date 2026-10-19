@@ -200,12 +200,13 @@ async fn main(spawner: Spawner) {
     spawner.must_spawn(led_task(p.PIN_25));
     let driver = Driver::new(p.USB, Irqs);
 
-    // TODO: confirm the spoofed VID/PID and strings against a real
-    // composite combo receiver before publishing a device identity.
-    let mut config = Config::new(0x046d, 0xc52b);
-    config.manufacturer = Some("Logitech");
-    config.product = Some("USB Receiver");
-    config.serial_number = Some("12863144");
+    // Device identity: poses as a generic vendor 2.4 GHz combo receiver —
+    // anonymous cheap-OEM gear, nothing to diff against a spec sheet.
+    // The CLI's discovery defaults (vkbm-cli/src/lib.rs) must match.
+    let mut config = Config::new(0x258a, 0x0100);
+    config.manufacturer = None;
+    config.product = Some("2.4G Wireless Receiver");
+    config.serial_number = None;
     config.max_power = 100;
     config.max_packet_size_0 = 64;
 

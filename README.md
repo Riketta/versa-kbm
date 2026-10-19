@@ -90,9 +90,12 @@ generated from one command vocabulary and covered by shared tests.
 
 ## Device identity
 
-The USB identity (VID/PID and strings) is a constant in
-`crates/vkbm-fw/src/main.rs`; the default mimics a common wireless combo
-receiver. Change it there if your use case needs a different appearance.
+The USB identity (VID/PID and strings) is defined by constants near the top
+of `crates/vkbm-fw/src/main.rs`, mirrored in the CLI's discovery defaults.
+By default the device poses as a generic 2.4 GHz wireless receiver
+(`258a:0100`, "2.4G Wireless Receiver", no manufacturer string) — the kind
+of anonymous combo dongle that ships with cheap keyboard/mouse sets.
+Change the constants if your use case needs a different appearance.
 
 ## Status
 
