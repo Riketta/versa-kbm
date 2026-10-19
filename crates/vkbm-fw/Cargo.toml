@@ -22,7 +22,9 @@ undocumented_unsafe_blocks = "warn"
 [features]
 default = []
 # Adds a CDC-ACM bench channel speaking `vkbm_proto::line` ASCII commands.
-dev-cdc = []
+# CDC adds two USB interfaces (comm + data) on top of the three HID ones;
+# the default `max-interface-count-4` would panic at builder time.
+dev-cdc = ["embassy-usb/max-interface-count-5"]
 
 [dependencies]
 embassy-executor = { version = "0.9.0", features = [
