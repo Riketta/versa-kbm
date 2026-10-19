@@ -209,6 +209,9 @@ static ARMED: AtomicBool = AtomicBool::new(true);
 /// Hardware master switch gate: toggled by a BOOTSEL tap at the board. While
 /// off, actuation is refused and no host command can switch it back on.
 static ENABLED: AtomicBool = AtomicBool::new(true);
+/// Dry-run mode: actuation commands reply [`Reply::Echo`] and skip the
+/// physical reports. Session-scoped: off after a reboot.
+static DRY_RUN: AtomicBool = AtomicBool::new(false);
 static PACING_INTER_MS: AtomicU8 = AtomicU8::new(4);
 static PACING_HOLD_MS: AtomicU8 = AtomicU8::new(10);
 
@@ -328,6 +331,12 @@ async fn main(spawner: Spawner) {
             };
             let reply = match gate {
                 Some(code) => Reply::Err(code),
+                // Dry-run: the full path runs, the physical step does not.
+                // Release-class commands still flow (consistent with the
+                // gates' "letting go always works" rule).
+                None if DRY_RUN.load(Ordering::Relaxed) && routing::is_new_actuation(&cmd) => {
+                    Reply::Echo
+                }
                 None => match cmd {
                     Command::KeyDown { usage } => {
                         if kb_keys.down(usage) {
@@ -410,7 +419,8 @@ async fn main(spawner: Spawner) {
                     | Command::Info
                     | Command::Arm
                     | Command::Disarm
-                    | Command::SetPacing { .. } => Reply::Ok,
+                    | Command::SetPacing { .. }
+                    | Command::DryRun { .. } => Reply::Ok,
                 },
             };
             match caller {
@@ -609,7 +619,12 @@ async fn dispatch(caller: Caller, cmd: Command) -> Reply {
     // Everything except the inline config commands runs on the actuator loop.
     let routed_to_actuator = !matches!(
         cmd,
-        Command::Ping | Command::Info | Command::Arm | Command::Disarm | Command::SetPacing { .. }
+        Command::Ping
+            | Command::Info
+            | Command::Arm
+            | Command::Disarm
+            | Command::SetPacing { .. }
+            | Command::DryRun { .. }
     );
     if routed_to_actuator {
         ACT_CMD.send((caller, cmd)).await;
@@ -632,6 +647,9 @@ async fn dispatch(caller: Caller, cmd: Command) -> Reply {
             if armed {
                 flags |= info_flags::ARMED;
             }
+            if DRY_RUN.load(Ordering::Relaxed) {
+                flags |= info_flags::DRY_RUN;
+            }
             Reply::Info { major: VERSION_MAJOR, minor: VERSION_MINOR, flags }
         }
         Command::Arm => {
@@ -645,6 +663,10 @@ async fn dispatch(caller: Caller, cmd: Command) -> Reply {
         Command::SetPacing { inter_ms, hold_ms } => {
             PACING_INTER_MS.store(inter_ms, Ordering::Relaxed);
             PACING_HOLD_MS.store(hold_ms, Ordering::Relaxed);
+            Reply::Ok
+        }
+        Command::DryRun { enabled } => {
+            DRY_RUN.store(enabled, Ordering::Relaxed);
             Reply::Ok
         }
         // Exhaustiveness only; routing above already sent every other

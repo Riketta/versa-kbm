@@ -27,6 +27,10 @@ pub mod info_flags {
 
     /// The soft arm gate is open ([`Command::Arm`] is in effect).
     pub const ARMED: u8 = 0x02;
+
+    /// Dry-run mode is on ([`Command::DryRun`]): actuation commands are
+    /// acknowledged with [`Reply::Echo`] and nothing is pressed or moved.
+    pub const DRY_RUN: u8 = 0x04;
 }
 
 /// A mouse button, in absolute-mouse report bit order.
@@ -136,6 +140,15 @@ pub enum Command {
         /// Button-hold time for clicks and taps, in milliseconds.
         hold_ms: u8,
     },
+    /// Toggles dry-run mode. While on, actuation commands run the full
+    /// command path (routing, gates, dedup) and reply [`Reply::Echo`] in
+    /// place of physically pressing keys, moving the pointer or clicking.
+    /// Release-class commands still flow. Session-scoped: off after a
+    /// reboot.
+    DryRun {
+        /// `true` turns dry-run on, `false` restores actuation.
+        enabled: bool,
+    },
 }
 
 /// Device-to-host reply.
@@ -143,6 +156,9 @@ pub enum Command {
 pub enum Reply {
     /// Command accepted and executed.
     Ok,
+    /// An actuation command was accepted but not physically executed:
+    /// the device is in dry-run mode ([`Command::DryRun`]).
+    Echo,
     /// Command rejected.
     Err(ErrorCode),
     /// Answer to [`Command::Info`].
@@ -253,6 +269,7 @@ pub mod routing {
                 Command::KeyUp { usage: 41 },
                 Command::MouseUp { button: Button::Left },
                 Command::SetPacing { inter_ms: 0, hold_ms: 0 },
+                Command::DryRun { enabled: true },
             ];
             for cmd in &passing {
                 assert!(!is_new_actuation(cmd), "{cmd:?} must bypass the gates");

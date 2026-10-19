@@ -134,6 +134,21 @@ enum Cmd {
         /// Button-hold time for clicks and taps, in milliseconds.
         hold_ms: u8,
     },
+    /// Toggle dry-run mode: actuation commands run the full command path and
+    /// are echoed back instead of physically pressing keys, moving the
+    /// pointer or clicking. Off after a reboot.
+    DryRun {
+        /// Turn dry-run on or off.
+        state: OnOff,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum OnOff {
+    /// Enable.
+    On,
+    /// Disable.
+    Off,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -228,6 +243,13 @@ fn main() -> Result<()> {
         Cmd::Pacing { inter_ms, hold_ms } => {
             act(&api, cli.vid, cli.pid, timeout, Command::SetPacing { inter_ms, hold_ms })
         }
+        Cmd::DryRun { state } => act(
+            &api,
+            cli.vid,
+            cli.pid,
+            timeout,
+            Command::DryRun { enabled: matches!(state, OnOff::On) },
+        ),
     }
 }
 
@@ -275,7 +297,8 @@ fn info(api: &HidApi, vid: u16, pid: u16, timeout: Duration) -> Result<()> {
         vkbm_proto::Reply::Info { major, minor, flags } => {
             let switch = if flags & info_flags::SWITCH_ON != 0 { "on" } else { "off" };
             let arm = if flags & info_flags::ARMED != 0 { "on" } else { "off" };
-            println!("vkbm firmware v{major}.{minor} switch={switch} arm={arm}");
+            let dry = if flags & info_flags::DRY_RUN != 0 { "on" } else { "off" };
+            println!("vkbm firmware v{major}.{minor} switch={switch} arm={arm} dry={dry}");
         }
         other => bail!("unexpected reply to INFO: {other:?}"),
     }
@@ -285,7 +308,12 @@ fn info(api: &HidApi, vid: u16, pid: u16, timeout: Duration) -> Result<()> {
 fn act(api: &HidApi, vid: u16, pid: u16, timeout: Duration, cmd: Command) -> Result<()> {
     let mut client = open(api, vid, pid)?;
     let reply = request(&mut client, cmd, timeout)?;
-    println!("{reply:?}");
+    match reply {
+        vkbm_proto::Reply::Echo => {
+            println!("dry-run echo: {cmd:?} (nothing actuated)");
+        }
+        other => println!("{other:?}"),
+    }
     Ok(())
 }
 

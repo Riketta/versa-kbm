@@ -95,7 +95,7 @@ freshly flashed board reports the firmware crate's own version
 ```sh
 vkbm list                 # enumerate HID devices, mark the versa-kbm channel
 vkbm ping                 # handshake + round-trip latency
-vkbm info                 # firmware version, switch and arm gate state
+vkbm info                 # firmware version, switch, arm and dry-run state
 vkbm move 16384 16384     # pointer to center (coordinates are 0..=32767)
 vkbm move-rel -100 0      # pointer by a delta (anchored to the device's last position)
 vkbm press 4096 4096      # move + left-click
@@ -103,6 +103,8 @@ vkbm key 44               # tap space (HID usage code; 41 = ESC)
 vkbm mouse click right    # click a button at the current position
 vkbm wheel 3              # scroll up; horizontal: vkbm wheel 0 -3
 vkbm pacing 4 10          # step gap / button hold, in milliseconds
+vkbm dry-run on           # commands echo back, nothing actuates
+vkbm dry-run off          # back to real actuation (also: off after reboot)
 vkbm disarm               # killswitch: actuation refused until...
 vkbm arm                  # ...re-armed (vkbm release lets go of everything)
 ```

@@ -135,6 +135,17 @@ pub fn decode(line: &[u8]) -> Result<Command, LineError> {
         let hold_ms = num_u8(arg(&mut words)?)?;
         no_more(&mut words)?;
         Ok(Command::SetPacing { inter_ms, hold_ms })
+    } else if head.eq_ignore_ascii_case(b"DRY") {
+        let tok = arg(&mut words)?;
+        let enabled = if tok.eq_ignore_ascii_case(b"on") {
+            true
+        } else if tok.eq_ignore_ascii_case(b"off") {
+            false
+        } else {
+            return Err(LineError::BadArguments);
+        };
+        no_more(&mut words)?;
+        Ok(Command::DryRun { enabled })
     } else {
         Err(LineError::UnknownCommand)
     }
@@ -162,6 +173,9 @@ pub fn encode<'a>(cmd: &Command, out: &'a mut [u8]) -> Result<&'a str, EncodeErr
         Command::Arm => core::write!(w, "ARM"),
         Command::Disarm => core::write!(w, "DISARM"),
         Command::SetPacing { inter_ms, hold_ms } => core::write!(w, "SP {inter_ms} {hold_ms}"),
+        Command::DryRun { enabled } => {
+            core::write!(w, "DRY {}", if enabled { "on" } else { "off" })
+        }
     };
     finish(w, ok)
 }
@@ -174,11 +188,13 @@ pub fn encode_reply<'a>(reply: &Reply, out: &'a mut [u8]) -> Result<&'a str, Enc
     let mut w = LineOut { buf: out, pos: 0 };
     let ok = match *reply {
         Reply::Ok => core::write!(w, "OK"),
+        Reply::Echo => core::write!(w, "ECHO"),
         Reply::Info { major, minor, flags } => core::write!(
             w,
-            "VKBM {major}.{minor} switch={} arm={}",
+            "VKBM {major}.{minor} switch={} arm={} dry={}",
             if flags & crate::info_flags::SWITCH_ON != 0 { "on" } else { "off" },
-            if flags & crate::info_flags::ARMED != 0 { "on" } else { "off" }
+            if flags & crate::info_flags::ARMED != 0 { "on" } else { "off" },
+            if flags & crate::info_flags::DRY_RUN != 0 { "on" } else { "off" }
         ),
         Reply::Err(code) => core::write!(
             w,
@@ -357,6 +373,8 @@ mod tests {
         assert_eq!(decode(b"CA 100 200"), Ok(Command::ClickAbs { x: 100, y: 200 }));
         assert_eq!(decode(b"W -127 127"), Ok(Command::Wheel { v: -127, h: 127 }));
         assert_eq!(decode(b"SP 5 10"), Ok(Command::SetPacing { inter_ms: 5, hold_ms: 10 }));
+        assert_eq!(decode(b"DRY on"), Ok(Command::DryRun { enabled: true }));
+        assert_eq!(decode(b"dry OFF"), Ok(Command::DryRun { enabled: false }));
     }
 
     #[test]
@@ -371,6 +389,8 @@ mod tests {
         assert_eq!(decode(b"KD 300"), Err(LineError::BadNumber));
         assert_eq!(decode(b"KD -1"), Err(LineError::BadNumber));
         assert_eq!(decode(b"MD toe"), Err(LineError::BadButton));
+        assert_eq!(decode(b"DRY"), Err(LineError::BadArguments));
+        assert_eq!(decode(b"DRY maybe"), Err(LineError::BadArguments));
         let long = [b'A'; MAX_LINE_LEN + 1];
         assert_eq!(decode(&long), Err(LineError::TooLong));
     }
@@ -393,6 +413,7 @@ mod tests {
             Command::Arm,
             Command::Disarm,
             Command::SetPacing { inter_ms: 5, hold_ms: 10 },
+            Command::DryRun { enabled: true },
         ];
         let mut buf = [0u8; MAX_LINE_LEN];
         for cmd in samples {
@@ -405,6 +426,7 @@ mod tests {
     fn encodes_replies() {
         let mut buf = [0u8; MAX_LINE_LEN];
         assert_eq!(encode_reply(&Reply::Ok, &mut buf), Ok("OK"));
+        assert_eq!(encode_reply(&Reply::Echo, &mut buf), Ok("ECHO"));
         assert_eq!(
             encode_reply(
                 &Reply::Info {
@@ -414,11 +436,24 @@ mod tests {
                 },
                 &mut buf
             ),
-            Ok("VKBM 0.1 switch=on arm=on")
+            Ok("VKBM 0.1 switch=on arm=on dry=off")
+        );
+        assert_eq!(
+            encode_reply(
+                &Reply::Info {
+                    major: 0,
+                    minor: 1,
+                    flags: crate::info_flags::SWITCH_ON
+                        | crate::info_flags::ARMED
+                        | crate::info_flags::DRY_RUN
+                },
+                &mut buf
+            ),
+            Ok("VKBM 0.1 switch=on arm=on dry=on")
         );
         assert_eq!(
             encode_reply(&Reply::Info { major: 0, minor: 1, flags: 0 }, &mut buf),
-            Ok("VKBM 0.1 switch=off arm=off")
+            Ok("VKBM 0.1 switch=off arm=off dry=off")
         );
         assert_eq!(encode_reply(&Reply::Err(ErrorCode::Disarmed), &mut buf), Ok("ERR DISARMED"));
         assert_eq!(

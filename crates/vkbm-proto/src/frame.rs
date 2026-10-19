@@ -56,8 +56,10 @@ mod tag {
     pub(super) const ARM: u8 = 0x31;
     pub(super) const DISARM: u8 = 0x32;
     pub(super) const SET_PACING: u8 = 0x33;
+    pub(super) const DRY_RUN: u8 = 0x34;
 
     pub(super) const REPLY_OK: u8 = 0x00;
+    pub(super) const REPLY_ECHO: u8 = 0x01;
     pub(super) const REPLY_INFO: u8 = 0x02;
     pub(super) const REPLY_ERR: u8 = 0xFF;
 
@@ -126,6 +128,10 @@ pub fn encode(cmd: &Command, seq: u8, out: &mut [u8; FRAME_LEN]) {
             out[2] = inter_ms;
             out[3] = hold_ms;
         }
+        Command::DryRun { enabled } => {
+            out[1] = tag::DRY_RUN;
+            out[2] = u8::from(enabled);
+        }
     }
 }
 
@@ -179,6 +185,7 @@ pub fn decode(data: &[u8]) -> Result<(u8, Command), FrameError> {
             let [inter_ms, hold_ms] = two(payload)?;
             Command::SetPacing { inter_ms, hold_ms }
         }
+        tag::DRY_RUN => Command::dry_run_or(payload)?,
         _ => return Err(FrameError::UnknownTag),
     };
     Ok((seq, cmd))
@@ -190,6 +197,7 @@ pub fn encode_reply(seq: u8, reply: &Reply, out: &mut [u8; FRAME_LEN]) {
     buf[0] = seq;
     match *reply {
         Reply::Ok => buf[1] = tag::REPLY_OK,
+        Reply::Echo => buf[1] = tag::REPLY_ECHO,
         Reply::Info { major, minor, flags } => {
             buf[1] = tag::REPLY_INFO;
             buf[2] = major;
@@ -224,6 +232,7 @@ pub fn decode_reply(data: &[u8]) -> Result<(u8, Reply), FrameError> {
     };
     let reply = match t {
         tag::REPLY_OK => Reply::ok_or(payload)?,
+        tag::REPLY_ECHO => Reply::echo_or(payload)?,
         tag::REPLY_INFO => {
             let [major, minor, flags] = three(payload)?;
             Reply::Info { major, minor, flags }
@@ -310,11 +319,28 @@ impl Command {
     fn disarm_or(payload: &[u8]) -> Result<Self, FrameError> {
         empty(payload).map(|()| Self::Disarm)
     }
+
+    fn dry_run_or(payload: &[u8]) -> Result<Self, FrameError> {
+        bool_or(payload).map(|enabled| Self::DryRun { enabled })
+    }
 }
 
 impl Reply {
     fn ok_or(payload: &[u8]) -> Result<Self, FrameError> {
         empty(payload).map(|()| Self::Ok)
+    }
+
+    fn echo_or(payload: &[u8]) -> Result<Self, FrameError> {
+        empty(payload).map(|()| Self::Echo)
+    }
+}
+
+/// A strict wire boolean: only `0x00` and `0x01` decode.
+fn bool_or(payload: &[u8]) -> Result<bool, FrameError> {
+    match one(payload)? {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(FrameError::BadPayload),
     }
 }
 
@@ -371,6 +397,8 @@ mod tests {
             Command::Arm,
             Command::Disarm,
             Command::SetPacing { inter_ms: 5, hold_ms: 10 },
+            Command::DryRun { enabled: true },
+            Command::DryRun { enabled: false },
         ];
         for cmd in samples {
             roundtrip(cmd);
@@ -386,12 +414,14 @@ mod tests {
         assert_eq!(decode(&[SEQ, tag::MOUSE_DOWN, 0]), Err(FrameError::BadPayload));
         assert_eq!(decode(&[SEQ, tag::MOUSE_DOWN, 6]), Err(FrameError::BadPayload));
         assert_eq!(decode(&[SEQ, tag::MOVE_ABS, 1, 2, 3]), Err(FrameError::BadPayload));
+        assert_eq!(decode(&[SEQ, tag::DRY_RUN, 2]), Err(FrameError::BadPayload));
     }
 
     #[test]
     fn replies_roundtrip() {
         let samples = [
             Reply::Ok,
+            Reply::Echo,
             Reply::Info { major: 0, minor: 1, flags: crate::info_flags::SWITCH_ON },
             Reply::Err(ErrorCode::UnknownCommand),
             Reply::Err(ErrorCode::BadPayload),
