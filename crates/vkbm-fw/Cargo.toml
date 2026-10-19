@@ -54,6 +54,12 @@ usbd-hid = "0.8.1"
 
 vkbm-proto = { path = "../vkbm-proto" }
 
+[profile.dev]
+# The USB peripheral's setup-packet timing can't keep up at opt-level 0:
+# the board boots with no device enumerating. Optimize dev builds too;
+# overflow checks and debug symbols stay on (dev defaults).
+opt-level = 2
+
 [profile.release]
 # Enable generation of debug symbols even on release builds.
 debug = true
