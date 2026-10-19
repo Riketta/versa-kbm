@@ -35,6 +35,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # hidapi (the CLI's transport) links libudev on Linux; the runner
+      # image ships pkg-config but not the library itself.
+      - name: Install libudev (hidapi dependency)
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev
+
       - name: Format (nightly rustfmt options)
         run: cargo +nightly fmt --all --check
 
