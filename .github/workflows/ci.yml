@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  host:
+    name: Host · fmt / clippy / test (proto + CLI)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rustfmt.toml uses unstable options, so formatting must run under
+      # nightly rustfmt; clippy/tests stay on the stable toolchain pinned
+      # by rust-toolchain.toml (installed explicitly because plain `cargo`
+      # must resolve stable regardless of install order).
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format (nightly rustfmt options)
+        run: cargo +nightly fmt --all --check
+
+      # The firmware crate is excluded from the workspace, so the root
+      # `fmt --all` never sees it; check it separately to keep the whole
+      # repo covered by the same style rules.
+      - name: Format (firmware crate)
+        working-directory: crates/vkbm-fw
+        run: cargo +nightly fmt --all --check
+
+      - name: "Clippy (pedantic + denied unwrap/expect/panic/indexing/slicing)"
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Tests (protocol + CLI)
+        run: cargo test --locked
+
+  firmware:
+    name: Firmware · fmt / clippy / build (RP2040)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+
+      # `targets` adds thumbv6m to the stable toolchain that the repo's
+      # rust-toolchain.toml resolves to; .cargo/config.toml makes it the
+      # default build target for the firmware crate.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: thumbv6m-none-eabi
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/vkbm-fw
+
+      - name: Format (nightly rustfmt options)
+        working-directory: crates/vkbm-fw
+        run: cargo +nightly fmt --all --check
+
+      - name: "Clippy (default + dev-cdc bench channel)"
+        working-directory: crates/vkbm-fw
+        run: |
+          cargo clippy --locked -- -D warnings
+          cargo clippy --features dev-cdc --locked -- -D warnings
+
+      - name: Build release ELF
+        working-directory: crates/vkbm-fw
+        run: cargo build --release --locked
+
+      # Cargo writes the extension-less ELF (`vkbm-fw`); stage a `.elf`
+      # copy so the downloaded artifact is self-describing for flashing.
+      - name: Stage firmware image
+        working-directory: crates/vkbm-fw
+        run: cp target/thumbv6m-none-eabi/release/vkbm-fw vkbm-fw.elf
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vkbm-fw-${{ github.sha }}
+          path: crates/vkbm-fw/vkbm-fw.elf
+          if-no-files-found: error
