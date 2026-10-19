@@ -1,5 +1,4 @@
-//! Wire contract between the versa-kbm host tools (sphinx backend, companion
-//! CLI) and the RP2040 firmware.
+//! Wire contract between the versa-kbm host tools and the RP2040 firmware.
 //!
 //! Two encodings carry the same [`Command`]/[`Reply`] vocabulary:
 //!

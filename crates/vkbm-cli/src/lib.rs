@@ -20,9 +20,9 @@ use vkbm_proto::{
     },
 };
 
-/// Default USB identity to look for (placeholder until the M2 identity pass).
+/// Default USB identity to look for (must match the firmware's constants).
 pub const DEFAULT_VID: u16 = 0x046d;
-/// Default USB identity to look for (placeholder until the M2 identity pass).
+/// Default USB identity to look for (must match the firmware's constants).
 pub const DEFAULT_PID: u16 = 0xc52b;
 /// Vendor control channel usage page, from the firmware report descriptor.
 pub const VENDOR_USAGE_PAGE: u16 = 0xff00;

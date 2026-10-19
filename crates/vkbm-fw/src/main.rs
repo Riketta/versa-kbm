@@ -1,4 +1,4 @@
-//! versa-kbm firmware (M3 actuation).
+//! versa-kbm firmware — RP2040 composite HID virtual keyboard/mouse.
 //!
 //! RP2040 composite USB device:
 //! - interface 0: HID keyboard (6KRO, modifier-aware),
@@ -14,7 +14,8 @@
 //! with the configured pacing. `Disarm` (soft killswitch) refuses actuation
 //! until `Arm`; `ReleaseAll` always works, even disarmed.
 //!
-//! Identity strings are a placeholder until the M2 identity pass.
+//! The USB identity (VID/PID and strings) is a constant near the top of
+//! `main` — see the README's "Device identity" section.
 
 #![no_std]
 #![no_main]
@@ -199,8 +200,8 @@ async fn main(spawner: Spawner) {
     spawner.must_spawn(led_task(p.PIN_25));
     let driver = Driver::new(p.USB, Irqs);
 
-    // TODO(M2): identity pass - confirm the spoofed VID/PID and strings
-    // against a real composite combo receiver.
+    // TODO: confirm the spoofed VID/PID and strings against a real
+    // composite combo receiver before publishing a device identity.
     let mut config = Config::new(0x046d, 0xc52b);
     config.manufacturer = Some("Logitech");
     config.product = Some("USB Receiver");
@@ -374,7 +375,7 @@ async fn main(spawner: Spawner) {
     #[cfg(feature = "dev-cdc")]
     let cdc_fut = cdc::run(cdc);
 
-    info!("versa-kbm up (M3 actuation)");
+    info!("versa-kbm up");
 
     #[cfg(feature = "dev-cdc")]
     join(usb_fut, join(reader_fut, join(actuator_fut, join(logic_fut, cdc_fut)))).await;
