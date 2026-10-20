@@ -13,19 +13,18 @@ pub const CHUNK_MAX: i32 = 127;
 /// Splits `(dx, dy)` into `(i8, i8)` chunks that sum back to exactly the
 /// input. A zero delta yields no chunks - and no USB traffic - which still
 /// toggles the firmware's pointer routing (see the `MouseMoveRel` handler).
-#[must_use]
 pub fn plan(dx: i16, dy: i16) -> impl Iterator<Item = (i8, i8)> {
-    let mut rest_dx = i32::from(dx);
-    let mut rest_dy = i32::from(dy);
+    let mut remaining = [i32::from(dx), i32::from(dy)];
     core::iter::from_fn(move || {
-        if rest_dx == 0 && rest_dy == 0 {
+        if remaining.iter().all(|&rest| rest == 0) {
             return None;
         }
-        let step_dx = clamp(rest_dx);
-        let step_dy = clamp(rest_dy);
-        rest_dx -= i32::from(step_dx);
-        rest_dy -= i32::from(step_dy);
-        Some((step_dx, step_dy))
+        let step = remaining.map(clamp);
+        for (rest, delta) in remaining.iter_mut().zip(step) {
+            *rest -= i32::from(delta);
+        }
+        let [sx, sy] = step;
+        Some((sx, sy))
     })
 }
 

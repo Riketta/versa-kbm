@@ -36,15 +36,13 @@ impl PointerLatches {
     /// owns the press and the button bits to report **on that interface**.
     pub fn press(&mut self, button: Button, preferred_abs: bool) -> (bool, u8) {
         let slot = usize::from(button as u8 - 1);
-        let on_abs = match self.owner.get(slot).copied().flatten() {
-            Some(on_abs) => on_abs,
-            None => {
-                if let Some(s) = self.owner.get_mut(slot) {
-                    *s = Some(preferred_abs);
-                }
-                preferred_abs
+        let owned = self.owner.get(slot).copied().flatten();
+        let on_abs = owned.unwrap_or_else(|| {
+            if let Some(s) = self.owner.get_mut(slot) {
+                *s = Some(preferred_abs);
             }
-        };
+            preferred_abs
+        });
         let bit = 1u8 << slot;
         if on_abs {
             self.abs |= bit;

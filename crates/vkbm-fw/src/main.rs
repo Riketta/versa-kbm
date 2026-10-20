@@ -457,8 +457,8 @@ async fn main(spawner: Spawner) {
                         // one. Only this interface's own button bits ride
                         // along (a press owned elsewhere is never carried).
                         let mut stream = chunks::plan(dx, dy).peekable();
-                        while let Some((step_dx, step_dy)) = stream.next() {
-                            emit_rel_mouse(&mut rel_mouse, latches.bits(true), 0, step_dx, step_dy)
+                        while let Some(chunk) = stream.next() {
+                            emit_rel_mouse(&mut rel_mouse, latches.bits(true), 0, chunk.0, chunk.1)
                                 .await;
                             if stream.peek().is_some() {
                                 Timer::after_millis(inter_ms()).await;
