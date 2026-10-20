@@ -458,14 +458,8 @@ async fn main(spawner: Spawner) {
                         // along (a press owned elsewhere is never carried).
                         let mut stream = chunks::plan(dx, dy).peekable();
                         while let Some((step_dx, step_dy)) = stream.next() {
-                            emit_rel_mouse(
-                                &mut rel_mouse,
-                                latches.bits(true),
-                                0,
-                                step_dx,
-                                step_dy,
-                            )
-                            .await;
+                            emit_rel_mouse(&mut rel_mouse, latches.bits(true), 0, step_dx, step_dy)
+                                .await;
                             if stream.peek().is_some() {
                                 Timer::after_millis(inter_ms()).await;
                             }
@@ -495,9 +489,8 @@ async fn main(spawner: Spawner) {
                         rel_active = false;
                         Timer::after_millis(inter_ms()).await;
                         Timer::after_millis(hold_ms()).await;
-                        let (_, bits) = latches
-                            .release(Button::Left)
-                            .unwrap_or((on_abs, latches.bits(on_abs)));
+                        let (_, bits) =
+                            latches.release(Button::Left).unwrap_or((on_abs, latches.bits(on_abs)));
                         emit_pointer_buttons(&mut mouse, &mut rel_mouse, &mouse_pos, on_abs, bits)
                             .await;
                         Reply::Ok
