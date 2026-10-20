@@ -11,9 +11,11 @@
 
 #![no_std]
 
+pub mod chunks;
 pub mod dedup;
 pub mod frame;
 pub mod line;
+pub mod pointer;
 
 /// Highest coordinate accepted by the absolute-mouse mapping. This is the HID
 /// logical maximum; the OS scales the range across the desktop.

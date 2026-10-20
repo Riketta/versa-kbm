@@ -4,15 +4,22 @@
 //! - interface 0: HID keyboard (6KRO, modifier-aware),
 //! - interface 1: HID **absolute mouse** (5 buttons, wheel, pan, 16-bit
 //!   X/Y over the full desktop),
-//! - interface 2: HID vendor control channel (usage page `0xFF00`) speaking
+//! - interface 2: HID **relative mouse** (5 buttons, wheel, 8-bit rel X/Y
+//!   through the OS pointer stack, ballistics included),
+//! - interface 3: HID vendor control channel (usage page `0xFF00`) speaking
 //!   the `vkbm_proto::frame` protocol,
 //! - with the `dev-cdc` feature: a CDC-ACM bench port speaking the same
 //!   commands as `vkbm_proto::line` ASCII.
 //!
-//! Both channels feed one actuator loop that owns the latched keyboard/mouse
-//! state and sequences compound commands (`KeyTap`, `ClickAbs`, `Wheel`)
-//! with the configured pacing. `Disarm` (soft killswitch) refuses actuation
-//! until `Arm`; `ReleaseAll` always works, even disarmed. A tap on the
+//! Both command channels feed one actuator loop that owns the latched
+//! keyboard and the per-interface button latches, and sequences compound
+//! commands (`KeyTap`, `ClickAbs`, `Wheel`, chunked `MouseMoveRel`) with the
+//! configured pacing. New presses ride whichever pointer moved last, so a
+//! click always lands where the host drove the cursor; each press is owned
+//! by the interface it was pressed on - moves never carry another pointer's
+//! buttons, and a release always rides its owner. `Disarm` (soft killswitch)
+//! refuses actuation until `Arm`; `ReleaseAll` always works, even disarmed.
+//! A tap on the
 //! board's BOOTSEL button is a hardware master switch that disables actuation
 //! outright - software can neither clear it nor override the release it
 //! forces.
@@ -83,6 +90,7 @@ use vkbm_proto::{
     Command,
     ErrorCode,
     Reply,
+    chunks,
     dedup::SeqDedup,
     frame::{
         self,
@@ -90,6 +98,7 @@ use vkbm_proto::{
         FrameError,
     },
     info_flags,
+    pointer::PointerLatches,
     routing,
 };
 
@@ -99,6 +108,9 @@ bind_interrupts!(struct Irqs {
 
 /// Absolute-mouse report: buttons byte, wheel, pan, 16-bit X, 16-bit Y.
 const MOUSE_REPORT_LEN: usize = 7;
+
+/// Relative-mouse report: buttons byte, wheel, 8-bit X delta, 8-bit Y delta.
+const REL_MOUSE_REPORT_LEN: usize = 4;
 
 /// Keyboard input report: modifier, reserved, 6 keycodes.
 const KEYBOARD_REPORT_LEN: usize = 8;
@@ -110,6 +122,10 @@ const KEYBOARD_REPORT_LEN_U16: u16 = KEYBOARD_REPORT_LEN as u16;
 /// u16 twin of [`MOUSE_REPORT_LEN`] for descriptor config fields.
 #[allow(clippy::cast_possible_truncation)] // 7 fits u16
 const MOUSE_REPORT_LEN_U16: u16 = MOUSE_REPORT_LEN as u16;
+
+/// u16 twin of [`REL_MOUSE_REPORT_LEN`] for descriptor config fields.
+#[allow(clippy::cast_possible_truncation)] // 4 fits u16
+const REL_MOUSE_REPORT_LEN_U16: u16 = REL_MOUSE_REPORT_LEN as u16;
 
 /// u16 twin of [`FRAME_LEN`] for descriptor config fields.
 #[allow(clippy::cast_possible_truncation)] // 64 fits u16
@@ -186,6 +202,46 @@ const MOUSE_REPORT_DESCRIPTOR: &[u8] = &[
     0xC0, // End Collection
 ];
 
+/// Relative-mouse report descriptor: 5 buttons, wheel, and 8-bit relative
+/// X/Y - the bog-standard mouse collection a generic rodent reports. These
+/// deltas go through the OS pointer stack (acceleration ballistics apply),
+/// which is what makes closed-loop targeting monitor-independent: absolute
+/// reports are normalized to the primary display, relative ones are not.
+const REL_MOUSE_REPORT_DESCRIPTOR: &[u8] = &[
+    0x05, 0x01, // Usage Page (Generic Desktop)
+    0x09, 0x02, // Usage (Mouse)
+    0xA1, 0x01, // Collection (Application)
+    0x09, 0x01, //   Usage (Pointer)
+    0xA1, 0x00, //   Collection (Physical)
+    0x05, 0x09, //     Usage Page (Button)
+    0x19, 0x01, //     Usage Minimum (1)
+    0x29, 0x05, //     Usage Maximum (5)
+    0x15, 0x00, //     Logical Minimum (0)
+    0x25, 0x01, //     Logical Maximum (1)
+    0x95, 0x05, //     Report Count (5)
+    0x75, 0x01, //     Report Size (1)
+    0x81, 0x02, //     Input (Data, Var, Abs)
+    0x95, 0x01, //     Report Count (1)
+    0x75, 0x03, //     Report Size (3)
+    0x81, 0x01, //     Input (Const, padding)
+    0x05, 0x01, //     Usage Page (Generic Desktop)
+    0x09, 0x38, //     Usage (Wheel)
+    0x15, 0x81, //     Logical Minimum (-127)
+    0x25, 0x7F, //     Logical Maximum (127)
+    0x75, 0x08, //     Report Size (8)
+    0x95, 0x01, //     Report Count (1)
+    0x81, 0x06, //     Input (Data, Var, Rel)
+    0x09, 0x30, //     Usage (X)
+    0x09, 0x31, //     Usage (Y)
+    0x15, 0x81, //     Logical Minimum (-127)
+    0x25, 0x7F, //     Logical Maximum (127)
+    0x75, 0x08, //     Report Size (8)
+    0x95, 0x02, //     Report Count (2)
+    0x81, 0x06, //     Input (Data, Var, Rel)
+    0xC0, //   End Collection
+    0xC0, // End Collection
+];
+
 /// Vendor control channel descriptor: 64-byte input and output reports on
 /// vendor usage page `0xFF00`. This is the production command path.
 const VENDOR_REPORT_DESCRIPTOR: &[u8] = &[
@@ -254,6 +310,7 @@ async fn main(spawner: Spawner) {
     // ordering is what the class borrows require.
     let mut kb_state = State::new();
     let mut mouse_state = State::new();
+    let mut rel_mouse_state = State::new();
     let mut vendor_state = State::new();
     let mut vendor_handler = VendorHandler;
     #[cfg(feature = "dev-cdc")]
@@ -290,6 +347,18 @@ async fn main(spawner: Spawner) {
     let mut mouse =
         HidWriter::<_, MOUSE_REPORT_LEN>::new(&mut builder, &mut mouse_state, mouse_config);
 
+    let rel_mouse_config = HidConfig {
+        report_descriptor: REL_MOUSE_REPORT_DESCRIPTOR,
+        request_handler: None,
+        poll_ms: 4,
+        max_packet_size: REL_MOUSE_REPORT_LEN_U16,
+    };
+    let mut rel_mouse = HidWriter::<_, REL_MOUSE_REPORT_LEN>::new(
+        &mut builder,
+        &mut rel_mouse_state,
+        rel_mouse_config,
+    );
+
     // Vendor control channel: production command path.
     let vendor_config = HidConfig {
         report_descriptor: VENDOR_REPORT_DESCRIPTOR,
@@ -317,6 +386,17 @@ async fn main(spawner: Spawner) {
     let actuator_fut = async {
         let mut kb_keys = KeyboardState::new();
         let mut mouse_pos = MouseState::new();
+        // Button latches with per-interface ownership: a press lives on the
+        // interface it was pressed on, moves never carry another pointer's
+        // buttons, and a release always rides its owner (the OS combines
+        // buttons across mice - broadcasting a pressed state onto both
+        // interfaces would latch it until both released).
+        let mut latches = PointerLatches::new();
+        // Which pointer interface new presses ride: the one that moved
+        // last. Hosts move before pressing, so the click lands on the same
+        // pointer as the move - pressing on the other one would emit an
+        // absolute report and yank the cursor to the stale anchor first.
+        let mut rel_active = false;
         loop {
             let (caller, cmd) = ACT_CMD.receive().await;
             // Re-check the gates at execution time: a command can sit queued
@@ -366,52 +446,101 @@ async fn main(spawner: Spawner) {
                     }
                     Command::MouseMoveAbs { x, y } => {
                         mouse_pos.move_abs(x, y);
-                        emit_mouse(&mut mouse, &mouse_pos, 0, 0).await;
+                        emit_mouse(&mut mouse, &mouse_pos, latches.bits(false), 0, 0).await;
+                        rel_active = false;
                         Reply::Ok
                     }
                     Command::MouseMoveRel { dx, dy } => {
-                        mouse_pos.move_rel(dx, dy);
-                        emit_mouse(&mut mouse, &mouse_pos, 0, 0).await;
+                        // The relative descriptor carries 8-bit deltas, so a
+                        // wire-sized delta is emitted as a paced stream of
+                        // <=127-count reports; the ack lands after the last
+                        // one. Only this interface's own button bits ride
+                        // along (a press owned elsewhere is never carried).
+                        let mut stream = chunks::plan(dx, dy).peekable();
+                        while let Some((step_dx, step_dy)) = stream.next() {
+                            emit_rel_mouse(
+                                &mut rel_mouse,
+                                latches.bits(true),
+                                0,
+                                step_dx,
+                                step_dy,
+                            )
+                            .await;
+                            if stream.peek().is_some() {
+                                Timer::after_millis(inter_ms()).await;
+                            }
+                        }
+                        rel_active = true;
                         Reply::Ok
                     }
                     Command::MouseDown { button } => {
-                        mouse_pos.down(button);
-                        emit_mouse(&mut mouse, &mouse_pos, 0, 0).await;
+                        let (on_abs, bits) = latches.press(button, !rel_active);
+                        emit_pointer_buttons(&mut mouse, &mut rel_mouse, &mouse_pos, on_abs, bits)
+                            .await;
                         Reply::Ok
                     }
                     Command::MouseUp { button } => {
-                        mouse_pos.up(button);
-                        emit_mouse(&mut mouse, &mouse_pos, 0, 0).await;
+                        let (on_abs, bits) = latches
+                            .release(button)
+                            .unwrap_or_else(|| (!rel_active, latches.bits(!rel_active)));
+                        emit_pointer_buttons(&mut mouse, &mut rel_mouse, &mouse_pos, on_abs, bits)
+                            .await;
                         Reply::Ok
                     }
                     Command::ClickAbs { x, y } => {
                         mouse_pos.move_abs(x, y);
-                        emit_mouse(&mut mouse, &mouse_pos, 0, 0).await;
+                        let (on_abs, bits) = latches.press(Button::Left, true);
+                        emit_pointer_buttons(&mut mouse, &mut rel_mouse, &mouse_pos, on_abs, bits)
+                            .await;
+                        rel_active = false;
                         Timer::after_millis(inter_ms()).await;
-                        mouse_pos.down(Button::Left);
-                        emit_mouse(&mut mouse, &mouse_pos, 0, 0).await;
                         Timer::after_millis(hold_ms()).await;
-                        mouse_pos.up(Button::Left);
-                        emit_mouse(&mut mouse, &mouse_pos, 0, 0).await;
+                        let (_, bits) = latches
+                            .release(Button::Left)
+                            .unwrap_or((on_abs, latches.bits(on_abs)));
+                        emit_pointer_buttons(&mut mouse, &mut rel_mouse, &mouse_pos, on_abs, bits)
+                            .await;
                         Reply::Ok
                     }
                     Command::Wheel { v, h } => {
-                        // The HID descriptor declares the wheel/pan logical
-                        // range as -127..=127, but the wire i8 carries -128;
+                        // The descriptors declare the wheel/pan logical range
+                        // as -127..=127, but the wire i8 carries -128;
                         // out-of-range values would wrap at the OS, so clamp
-                        // to the descriptor's range.
+                        // to the descriptors' range.
                         let v = v.clamp(-127, 127);
                         let h = h.clamp(-127, 127);
-                        emit_mouse(&mut mouse, &mouse_pos, v, h).await;
+                        let on_abs = !rel_active;
+                        emit_wheel(
+                            &mut mouse,
+                            &mut rel_mouse,
+                            &mouse_pos,
+                            on_abs,
+                            latches.bits(on_abs),
+                            v,
+                            h,
+                        )
+                        .await;
                         Timer::after_millis(inter_ms()).await;
-                        emit_mouse(&mut mouse, &mouse_pos, 0, 0).await;
+                        emit_wheel(
+                            &mut mouse,
+                            &mut rel_mouse,
+                            &mouse_pos,
+                            on_abs,
+                            latches.bits(on_abs),
+                            0,
+                            0,
+                        )
+                        .await;
                         Reply::Ok
                     }
                     Command::ReleaseAll => {
                         kb_keys.clear();
                         emit_kb(&mut kb, &kb_keys).await;
-                        mouse_pos.clear();
-                        emit_mouse(&mut mouse, &mouse_pos, 0, 0).await;
+                        latches.clear();
+                        // Both pointers: the safety release must unlatch
+                        // whatever either interface still reports.
+                        emit_mouse(&mut mouse, &mouse_pos, 0, 0, 0).await;
+                        emit_rel_mouse(&mut rel_mouse, 0, 0, 0, 0).await;
                         Reply::Ok
                     }
                     // Dispatch never routes config commands here.
@@ -444,14 +573,18 @@ async fn main(spawner: Spawner) {
         let mut dedup = SeqDedup::new();
         loop {
             let raw = VENDOR_EVENTS.receive().await;
-            let now_ms = embassy_time::Instant::now().as_millis();
+            let received_ms = embassy_time::Instant::now().as_millis();
             let reply = match frame::decode(&raw) {
                 Ok((seq, cmd)) => {
-                    if let Some(cached) = dedup.replay(seq, now_ms) {
+                    if let Some(cached) = dedup.replay(seq, received_ms) {
                         cached
                     } else {
                         let reply = dispatch(Caller::Vendor, cmd).await;
-                        dedup.remember(seq, reply, now_ms);
+                        // Stamp with the COMPLETION time: a chunked command
+                        // can run for seconds, and a resend queued behind it
+                        // must still land inside the replay window.
+                        let done_ms = embassy_time::Instant::now().as_millis();
+                        dedup.remember(seq, reply, done_ms);
                         reply
                     }
                 }
@@ -738,44 +871,23 @@ impl KeyboardState {
     }
 }
 
-/// Latched absolute-mouse state: held buttons plus the last reported
-/// position (the anchor for relative moves).
+/// Latched absolute-pointer anchor: the last absolutely reported position.
+/// Relative moves do not touch it - they never emit an absolute report - so
+/// the host re-anchors with the real position before any absolute click.
 struct MouseState {
-    buttons: u8,
     x: u16,
     y: u16,
 }
 
 impl MouseState {
     const fn new() -> Self {
-        Self { buttons: 0, x: ABS_MAX / 2, y: ABS_MAX / 2 }
+        Self { x: ABS_MAX / 2, y: ABS_MAX / 2 }
     }
 
     fn move_abs(&mut self, x: u16, y: u16) {
         self.x = x.min(ABS_MAX);
         self.y = y.min(ABS_MAX);
     }
-
-    fn move_rel(&mut self, dx: i16, dy: i16) {
-        self.x = clamp_axis(i32::from(self.x) + i32::from(dx));
-        self.y = clamp_axis(i32::from(self.y) + i32::from(dy));
-    }
-
-    fn down(&mut self, button: Button) {
-        self.buttons |= 1u8 << u32::from(button as u8 - 1);
-    }
-
-    fn up(&mut self, button: Button) {
-        self.buttons &= !(1u8 << u32::from(button as u8 - 1));
-    }
-
-    fn clear(&mut self) {
-        self.buttons = 0;
-    }
-}
-
-fn clamp_axis(value: i32) -> u16 {
-    u16::try_from(value.clamp(0, i32::from(ABS_MAX))).unwrap_or(0)
 }
 
 async fn emit_kb<'a>(
@@ -791,12 +903,13 @@ async fn emit_kb<'a>(
 
 async fn emit_mouse<'a>(
     writer: &mut HidWriter<'a, Driver<'a, USB>, MOUSE_REPORT_LEN>,
-    mouse: &MouseState,
+    anchor: &MouseState,
+    buttons: u8,
     wheel: i8,
     pan: i8,
 ) {
     let mut report = [0u8; MOUSE_REPORT_LEN];
-    report[0] = mouse.buttons;
+    report[0] = buttons;
     // For an i8 the two's-complement low byte is exactly the report byte
     // the descriptor declares (logical -127..=127).
     #[allow(clippy::cast_sign_loss)]
@@ -804,10 +917,67 @@ async fn emit_mouse<'a>(
         report[1] = wheel as u8;
         report[2] = pan as u8;
     }
-    report[3..5].copy_from_slice(&mouse.x.to_le_bytes());
-    report[5..7].copy_from_slice(&mouse.y.to_le_bytes());
+    report[3..5].copy_from_slice(&anchor.x.to_le_bytes());
+    report[5..7].copy_from_slice(&anchor.y.to_le_bytes());
     if let Err(e) = writer.write(&report).await {
         warn!("mouse report failed: {:?}", e);
+    }
+}
+
+/// Emits one relative-mouse report: held buttons, wheel tick and X/Y deltas.
+async fn emit_rel_mouse<'a>(
+    writer: &mut HidWriter<'a, Driver<'a, USB>, REL_MOUSE_REPORT_LEN>,
+    buttons: u8,
+    wheel: i8,
+    dx: i8,
+    dy: i8,
+) {
+    let mut report = [0u8; REL_MOUSE_REPORT_LEN];
+    report[0] = buttons;
+    // For an i8 the two's-complement low byte is exactly the report byte
+    // the descriptor declares (logical -127..=127).
+    #[allow(clippy::cast_sign_loss)]
+    {
+        report[1] = wheel as u8;
+        report[2] = dx as u8;
+        report[3] = dy as u8;
+    }
+    if let Err(e) = writer.write(&report).await {
+        warn!("relative mouse report failed: {:?}", e);
+    }
+}
+
+/// Emits one pointer's button-state report: the absolute pointer reports
+/// `buttons` at its anchor, the relative one as a zero-delta report.
+async fn emit_pointer_buttons<'a>(
+    abs: &mut HidWriter<'a, Driver<'a, USB>, MOUSE_REPORT_LEN>,
+    rel: &mut HidWriter<'a, Driver<'a, USB>, REL_MOUSE_REPORT_LEN>,
+    anchor: &MouseState,
+    on_abs: bool,
+    buttons: u8,
+) {
+    if on_abs {
+        emit_mouse(abs, anchor, buttons, 0, 0).await;
+    } else {
+        emit_rel_mouse(rel, buttons, 0, 0, 0).await;
+    }
+}
+
+/// Emits a wheel pulse on one pointer interface. The relative descriptor
+/// has no AC Pan, so horizontal ticks only ever ride the absolute pointer.
+async fn emit_wheel<'a>(
+    abs: &mut HidWriter<'a, Driver<'a, USB>, MOUSE_REPORT_LEN>,
+    rel: &mut HidWriter<'a, Driver<'a, USB>, REL_MOUSE_REPORT_LEN>,
+    anchor: &MouseState,
+    on_abs: bool,
+    buttons: u8,
+    v: i8,
+    h: i8,
+) {
+    if on_abs {
+        emit_mouse(abs, anchor, buttons, v, h).await;
+    } else {
+        emit_rel_mouse(rel, buttons, v, 0, 0).await;
     }
 }
 

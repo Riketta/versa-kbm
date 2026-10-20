@@ -1,10 +1,11 @@
 # versa-kbm
 
 Virtual keyboard and mouse on an RP2040 (Raspberry Pi Pico). The device
-enumerates as an ordinary composite HID device — a keyboard plus an
-**absolute mouse** — and executes commands sent by a host application over
-a vendor-defined HID control channel. Ships with a companion CLI (`vkbm`)
-for bring-up, bench testing, and manual actuation.
+enumerates as an ordinary composite HID device — a keyboard, an
+**absolute mouse**, and a **relative mouse** — and executes commands sent
+by a host application over a vendor-defined HID control channel. Ships
+with a companion CLI (`vkbm`) for bring-up, bench testing, and manual
+actuation.
 
 ## Why an absolute mouse
 
@@ -17,14 +18,17 @@ needed.
 
 ## Features
 
-- Composite HID: keyboard (6-key rollover + modifiers) and absolute mouse
-  (5 buttons, wheel, horizontal pan).
+- Composite HID: keyboard (6-key rollover + modifiers), absolute mouse
+  (5 buttons, wheel, horizontal pan) and a relative mouse (5 buttons,
+  wheel, 8-bit deltas) - two pointer collections, one device.
 - Control channel: HID vendor usage page `0xFF00`, 64-byte binary frames,
   acked with sequence numbers; one automatic resend on a lost ack, and the
   device replays the cached reply for a resent sequence instead of
   re-executing it.
 - Full command set: key down/up/tap, absolute and relative mouse movement,
-  button down/up, move-and-click, wheel/pan scrolling, release-all, pacing.
+  button down/up, move-and-click, wheel/pan scrolling (pan rides the
+  absolute pointer - the relative descriptor has no pan axis), release-all,
+  pacing.
 - Soft killswitch: `DISARM` refuses every actuation command until `ARM`.
 - Hardware master switch: a tap on BOOTSEL disables actuation at the device
   itself; software cannot clear it. Switching off also releases every held
@@ -97,7 +101,7 @@ vkbm list                 # enumerate HID devices, mark the versa-kbm channel
 vkbm ping                 # handshake + round-trip latency
 vkbm info                 # firmware version, switch, arm and dry-run state
 vkbm move 16384 16384     # pointer to center (coordinates are 0..=32767)
-vkbm move-rel -100 0      # pointer by a delta (anchored to the device's last position)
+vkbm move-rel -100 0      # pointer by a delta (goes through OS pointer ballistics)
 vkbm press 4096 4096      # move + left-click
 vkbm key 44               # tap space (HID usage code; 41 = ESC)
 vkbm mouse click right    # click a button at the current position
@@ -151,15 +155,18 @@ The device deduplicates by sequence number: because it acks *after*
 execution, a paced command can outlive the host's ack timeout, and the
 automatic resend would otherwise execute twice. A repeated sequence replays
 the cached reply instead. If you raise pacing above the ack timeout
-(`--timeout-ms`, default 250), raise the timeout with it.
+(`--timeout-ms`, default 250), raise the timeout with it; the same applies
+to large `move-rel` deltas, whose ack lands after the paced chunk stream -
+the CLI grows its deadline automatically.
 
 Two safeguards keep a repeated sequence from ever swallowing a fresh
 command: the host seeds each process's sequence counter from clock and
 process id (so a new CLI session almost never starts at the number the
 last session left cached), and the device only replays a repeated
-sequence within a 2 s window of its first execution (a true resend
-arrives within the ack timeout, well under that window). A fresh
-session's first command therefore always executes.
+sequence within a 2 s window of its **completion** (a resend queues
+behind the executing command, so it is processed shortly after the first
+run finishes even when that run takes seconds). A fresh session's first
+command therefore always executes.
 
 Absolute coordinates travel as `0..=32767` (`ABS_MAX`) per axis; values
 above that are clamped by the device. Wheel and pan ticks are `i8` on
@@ -185,9 +192,11 @@ Change the constants if your use case needs a different appearance.
   the cost of physical access to flip it back.
 - The USB identity is a fixed constant near the top of the firmware; it is
   not a guarantee of anything, only an appearance.
-- Relative movement (`move-rel`, line `MR`) is anchored to the last position
-  the device itself reported, not the OS cursor; another pointer on the
-  target machine makes it land elsewhere. Prefer absolute moves.
+- Relative movement (`move-rel`, line `MR`) emits true relative reports on
+  the device's relative-mouse interface. The OS applies pointer ballistics
+  to them, so the landed offset can differ from the raw delta (and another
+  pointer can move the cursor between reports); use absolute moves when
+  exact placement matters.
 - A key or button held across a failed command stays latched;
   `vkbm release` (line `RA`) always clears everything, even disarmed.
 - Tapping an already-held key or button releases it (a tap is

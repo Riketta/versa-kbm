@@ -8,19 +8,25 @@
 //! instead of executing again. Normal traffic increments the sequence, so
 //! only true resends ever match.
 //!
-//! The register stamps the execution time and replays only within
+//! The register stamps the **completion** time and replays only within
 //! [`REPLAY_WINDOW_MS`]. That keeps the replay bounded to true resends - a
-//! resend arrives within the host's ack timeout, at most about a second
-//! even for max-paced commands - so a NEW host session that starts at the
-//! same sequence number the register still holds executes normally
-//! instead of swallowing its first command.
+//! resend is processed within about a second of the first execution
+//! finishing (it arrives after the host's ack timeout and queues behind the
+//! executing command). Stamping at completion (not at start) is what keeps
+//! that promise for long-running commands: a chunked relative move can run
+//! for seconds, and a resend queued behind it must still hit the cached
+//! reply instead of executing a second time. A NEW host session that starts
+//! at the same sequence number the register still holds, more than
+//! [`REPLAY_WINDOW_MS`] after the completion, executes normally instead of
+//! swallowing its first command.
 
 use crate::Reply;
 
-/// How long a cached reply stays eligible for replay, in milliseconds. A
-/// true resend arrives within the host ack timeout (under a second even
-/// for max-paced commands); a repeat past the window is treated as a new
-/// command that happens to reuse the sequence number and must execute.
+/// How long a cached reply stays eligible for replay, in milliseconds,
+/// measured from the command's completion. A true resend is processed
+/// shortly after the first execution finishes (it queues behind it); a
+/// repeat past the window is treated as a new command that happens to reuse
+/// the sequence number and must execute.
 pub const REPLAY_WINDOW_MS: u64 = 2_000;
 
 /// Last-executed sequence register for one command channel.

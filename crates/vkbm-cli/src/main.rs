@@ -74,9 +74,9 @@ enum Cmd {
         #[arg(value_parser = clap::value_parser!(u16).range(0..=i64::from(ABS_MAX)))]
         y: u16,
     },
-    /// Move the pointer by a relative delta. Relative moves are anchored to
-    /// the last position the device itself reported - another pointer on the
-    /// target machine can make them land elsewhere; prefer absolute moves.
+    /// Move the pointer by a relative delta. The OS applies its pointer
+    /// ballistics to relative reports, so the landed offset can differ from
+    /// the raw delta; use `move` when exact placement matters.
     MoveRel {
         /// Signed X delta.
         dx: i16,
@@ -126,8 +126,9 @@ enum Cmd {
     Release,
     /// Set actuation pacing: gap between sequenced report steps and
     /// button-hold time, in milliseconds. High values make paced commands
-    /// (`press`, `key`, `wheel`) outlive the ack timeout; the device dedups
-    /// resends, but raise `--timeout-ms` to match if you raise pacing.
+    /// (`press`, `key`, `wheel`, and chunked `move-rel` streams) outlive the
+    /// ack timeout; the device dedups resends by completion time, but raise
+    /// `--timeout-ms` to match if you raise pacing.
     Pacing {
         /// Gap between sequenced report steps, in milliseconds.
         inter_ms: u8,
@@ -197,7 +198,17 @@ fn main() -> Result<()> {
         Cmd::Info => info(&api, cli.vid, cli.pid, timeout),
         Cmd::Move { x, y } => act(&api, cli.vid, cli.pid, timeout, Command::MouseMoveAbs { x, y }),
         Cmd::MoveRel { dx, dy } => {
-            act(&api, cli.vid, cli.pid, timeout, Command::MouseMoveRel { dx, dy })
+            // The device acks only after the paced <=127-count chunk stream
+            // finishes, so the deadline grows with the requested delta.
+            let chunks = u64::from(dx.unsigned_abs().max(dy.unsigned_abs())).div_ceil(127);
+            let stream_ms = chunks.saturating_mul(CHUNK_STREAM_MS);
+            act(
+                &api,
+                cli.vid,
+                cli.pid,
+                timeout.saturating_add(Duration::from_millis(stream_ms)),
+                Command::MouseMoveRel { dx, dy },
+            )
         }
         Cmd::Press { x, y } => act(&api, cli.vid, cli.pid, timeout, Command::ClickAbs { x, y }),
         Cmd::Key { usage, down, up } => {
@@ -256,6 +267,11 @@ fn main() -> Result<()> {
 /// Host-side button-hold time for `mouse click` (device pacing applies to
 /// `press`/`key`; this two-step click is paced here).
 const CLICK_HOLD_MS: u64 = 25;
+
+/// Per-chunk stream cost used to size `move-rel` deadlines: the device
+/// paces the <=127-count reports at `inter_ms` (4 ms default) and each
+/// report waits up to one endpoint poll interval (4 ms).
+const CHUNK_STREAM_MS: u64 = 8;
 
 /// Enumerates HID devices. Infallible today, but kept `Result` so every
 /// subcommand keeps the same dispatch shape in `main`.

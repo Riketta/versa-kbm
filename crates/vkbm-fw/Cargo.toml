@@ -1,7 +1,7 @@
 [package]
 name = "vkbm-fw"
-description = "versa-kbm RP2040 firmware: composite HID keyboard + absolute mouse + vendor control channel."
-version = "0.4.0"
+description = "versa-kbm RP2040 firmware: composite HID keyboard + absolute/relative mouse + vendor control channel."
+version = "0.5.0"
 edition = "2024"
 publish = false
 
@@ -22,9 +22,10 @@ undocumented_unsafe_blocks = "warn"
 [features]
 default = []
 # Adds a CDC-ACM bench channel speaking `vkbm_proto::line` ASCII commands.
-# CDC adds two USB interfaces (comm + data) on top of the three HID ones;
-# the default `max-interface-count-4` would panic at builder time.
-dev-cdc = ["embassy-usb/max-interface-count-5"]
+# CDC adds two USB interfaces (comm + data) on top of the four HID ones
+# (keyboard, absolute mouse, relative mouse, vendor); the default
+# `max-interface-count-4` would panic at builder time.
+dev-cdc = ["embassy-usb/max-interface-count-6"]
 
 [dependencies]
 embassy-executor = { version = "0.9.0", features = [
