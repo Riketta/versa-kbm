@@ -39,6 +39,10 @@ pub const ACK_TIMEOUT_MS: u64 = 250;
 /// How long one ack may take before the attempt counts as lost.
 pub const ACK_TIMEOUT: Duration = Duration::from_millis(ACK_TIMEOUT_MS);
 
+/// Deadline for [`Client::open`]'s sacrificial ping. A present device acks
+/// in about a millisecond; only a silent device pays the full wait.
+const OPEN_BURN_TIMEOUT: Duration = Duration::from_millis(50);
+
 /// Client failures.
 #[derive(Debug)]
 pub enum Error {
@@ -104,8 +108,10 @@ pub fn find_device(api: &HidApi, vid: u16, pid: u16) -> Option<hidapi::DeviceInf
 trait Link {
     /// Writes one 64-byte frame.
     fn send(&mut self, report: &[u8; FRAME_LEN]) -> Result<(), Error>;
-    /// Reads one 64-byte report, or [`Error::Timeout`].
-    fn recv(&mut self, timeout: Duration) -> Result<[u8; FRAME_LEN], Error>;
+    /// Reads one 64-byte report, or [`Error::Timeout`]. `Ok(None)` marks a
+    /// short read: a partial report must count as junk downstream, never
+    /// decode as a plausible reply with a zero-filled tail.
+    fn recv(&mut self, timeout: Duration) -> Result<Option<[u8; FRAME_LEN]>, Error>;
 }
 
 struct HidLink {
@@ -120,18 +126,23 @@ impl Link for HidLink {
         let (_, dst) = out.split_at_mut(1);
         dst.copy_from_slice(report);
         let wrote = self.device.write(&out).map_err(Error::Write)?;
-        if wrote != out.len() {
+        // Windows counts the report-id prefix byte (`FRAME_LEN + 1`); Linux
+        // hidraw strips it and reports the payload length (`FRAME_LEN`)
+        // only. Both mean the whole frame was handed to the kernel.
+        if wrote != FRAME_LEN && wrote != out.len() {
             return Err(Error::ShortWrite { wrote, want: out.len() });
         }
         Ok(())
     }
 
-    fn recv(&mut self, timeout: Duration) -> Result<[u8; FRAME_LEN], Error> {
+    fn recv(&mut self, timeout: Duration) -> Result<Option<[u8; FRAME_LEN]>, Error> {
         let mut buf = [0u8; FRAME_LEN];
         let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
         match self.device.read_timeout(&mut buf, millis) {
-            Ok(n) if n > 0 => Ok(buf),
-            Ok(_) => Err(Error::Timeout),
+            Ok(FRAME_LEN) => Ok(Some(buf)),
+            Ok(0) => Err(Error::Timeout),
+            // A short report is junk, not a decodable reply.
+            Ok(_) => Ok(None),
             Err(e) => Err(Error::Read(e)),
         }
     }
@@ -142,7 +153,8 @@ impl Link for HidLink {
 /// session last used - the device would replay that session's cached reply
 /// and the command would be swallowed. Clock subsecond nanoseconds and the
 /// OS process id, mixed byte by byte, spread the starting points; zero maps
-/// to 1 because 0 is the device's never-executed slot.
+/// to 1 because the host never sends 0. [`Client::open`]'s sacrificial
+/// ping absorbs the residual collision risk.
 fn initial_seq() -> u8 {
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
     let pid = std::process::id();
@@ -166,13 +178,23 @@ pub struct Client {
 impl Client {
     /// Opens the vendor control channel of the first matching device.
     ///
+    /// Sends one sacrificial [`Command::Ping`] before returning: the device
+    /// replays a repeated sequence number for a short window after its
+    /// previous session, so a rapid host restart could collide with the
+    /// cached reply and silently swallow this session's first real command.
+    /// The throwaway ping burns that replay slot; its outcome is irrelevant
+    /// (a silent device fails again on the first real command either way),
+    /// so the result is discarded.
+    ///
     /// # Errors
     /// [`Error::NotFound`] when no device matches, [`Error::Open`] when the
     /// OS refuses the handle.
     pub fn open(api: &HidApi, vid: u16, pid: u16) -> Result<Self, Error> {
         let info = find_device(api, vid, pid).ok_or(Error::NotFound)?;
         let device = api.open_path(info.path()).map_err(Error::Open)?;
-        Ok(Self { link: Box::new(HidLink { device }), next_seq: initial_seq() })
+        let mut client = Self { link: Box::new(HidLink { device }), next_seq: initial_seq() };
+        let _ = client.request(&Command::Ping, OPEN_BURN_TIMEOUT);
+        Ok(client)
     }
 
     /// Sends one command and waits for its ack; a lost ack is resent once.
@@ -226,7 +248,11 @@ fn wait_ack(link: &mut dyn Link, seq: u8, timeout: Duration) -> Result<Reply, Er
         if now >= deadline {
             return Err(Error::Timeout);
         }
-        let raw = link.recv(deadline - now)?;
+        // A short read is junk like any undecodable frame.
+        let Some(raw) = link.recv(deadline - now)? else {
+            junk += 1;
+            continue;
+        };
         match frame::decode_reply(&raw) {
             Ok((got, reply)) if got == seq => return Ok(reply),
             // Stale (an earlier request's ack) or undecodable: tolerate a
@@ -289,8 +315,11 @@ mod tests {
             Ok(())
         }
 
-        fn recv(&mut self, _timeout: Duration) -> Result<[u8; FRAME_LEN], Error> {
-            self.replies.borrow_mut().pop_front().unwrap_or(Err(Error::Timeout))
+        fn recv(&mut self, _timeout: Duration) -> Result<Option<[u8; FRAME_LEN]>, Error> {
+            match self.replies.borrow_mut().pop_front() {
+                Some(reply) => reply.map(Some),
+                None => Err(Error::Timeout),
+            }
         }
     }
 

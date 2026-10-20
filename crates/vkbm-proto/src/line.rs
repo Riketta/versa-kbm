@@ -206,6 +206,7 @@ pub fn encode_reply<'a>(reply: &Reply, out: &'a mut [u8]) -> Result<&'a str, Enc
                 ErrorCode::NotImplemented => "NOT-IMPLEMENTED",
                 ErrorCode::KeyboardFull => "KEYBOARD-FULL",
                 ErrorCode::Disabled => "DISABLED",
+                ErrorCode::Undeliverable => "UNDELIVERABLE",
             }
         ),
     };
@@ -459,6 +460,10 @@ mod tests {
         assert_eq!(
             encode_reply(&Reply::Err(ErrorCode::NotImplemented), &mut buf),
             Ok("ERR NOT-IMPLEMENTED")
+        );
+        assert_eq!(
+            encode_reply(&Reply::Err(ErrorCode::Undeliverable), &mut buf),
+            Ok("ERR UNDELIVERABLE")
         );
         assert_eq!(
             encode_reply(&Reply::Err(ErrorCode::KeyboardFull), &mut buf),

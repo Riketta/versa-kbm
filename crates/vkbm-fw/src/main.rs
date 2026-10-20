@@ -98,8 +98,11 @@ use vkbm_proto::{
         FrameError,
     },
     info_flags,
+    keyboard::KeyboardState,
     pointer::PointerLatches,
     routing,
+    semver_major,
+    semver_minor,
 };
 
 bind_interrupts!(struct Irqs {
@@ -131,31 +134,12 @@ const REL_MOUSE_REPORT_LEN_U16: u16 = REL_MOUSE_REPORT_LEN as u16;
 #[allow(clippy::cast_possible_truncation)] // 64 fits u16
 const FRAME_LEN_U16: u16 = FRAME_LEN as u16;
 
-/// First digit of a version part (`b"2"` -> 2). Single-digit parts expected
-/// pre-1.0; anything longer contributes its leading digit.
-const fn leading_digit(bytes: &[u8]) -> u8 {
-    match bytes.split_first() {
-        Some((&b, _)) if b.is_ascii_digit() => b - b'0',
-        _ => 0,
-    }
-}
-
 /// Firmware version reported by `Info`, derived from the crate version so
-/// the two cannot drift (`"0.2.0"` -> major 0, minor 2).
-const VERSION_MAJOR: u8 = leading_digit(env!("CARGO_PKG_VERSION").as_bytes());
+/// the two cannot drift (`"0.2.0"` -> major 0, minor 2). The minor is
+/// parsed in full, so two-digit minors (0.10.0+) survive the wire's u8.
+const VERSION_MAJOR: u8 = semver_major(env!("CARGO_PKG_VERSION"));
 /// Firmware minor version (see [`VERSION_MAJOR`]).
-const VERSION_MINOR: u8 = version_minor(env!("CARGO_PKG_VERSION").as_bytes());
-
-/// The leading digit after the first `.` of a version string.
-const fn version_minor(mut bytes: &'static [u8]) -> u8 {
-    while let Some((&b, rest)) = bytes.split_first() {
-        if b == b'.' {
-            return leading_digit(rest);
-        }
-        bytes = rest;
-    }
-    0
-}
+const VERSION_MINOR: u8 = semver_minor(env!("CARGO_PKG_VERSION"));
 
 /// Absolute-mouse report descriptor: 5 buttons, wheel + AC Pan (relative
 /// ticks), and absolute 16-bit X/Y scaled by the OS across the desktop.
@@ -486,32 +470,78 @@ async fn main(spawner: Spawner) {
                         }
                     }
                     Command::MouseDown { button } => {
-                        let (on_abs, bits) = latches.press(button, !rel_active);
-                        emit_pointer_buttons(&mut mouse, &mut rel_mouse, &mouse_pos, on_abs, bits)
+                        // Emit only on a state change: re-pressing a button
+                        // that is already held would re-emit an absolute
+                        // report at the stale anchor and yank the OS cursor.
+                        let preferred_abs = !rel_active;
+                        let before = latches.bits(preferred_abs);
+                        let (on_abs, bits) = latches.press(button, preferred_abs);
+                        if bits != before {
+                            emit_pointer_buttons(
+                                &mut mouse,
+                                &mut rel_mouse,
+                                &mouse_pos,
+                                on_abs,
+                                bits,
+                            )
                             .await;
+                        }
                         Reply::Ok
                     }
                     Command::MouseUp { button } => {
-                        let (on_abs, bits) = latches
-                            .release(button)
-                            .unwrap_or_else(|| (!rel_active, latches.bits(!rel_active)));
-                        emit_pointer_buttons(&mut mouse, &mut rel_mouse, &mouse_pos, on_abs, bits)
+                        // Releasing a button that was not held changes no
+                        // interface's state, so no report goes out - the old
+                        // fallback re-emitted the stale absolute anchor and
+                        // dragged the cursor there.
+                        if let Some((on_abs, bits)) = latches.release(button) {
+                            emit_pointer_buttons(
+                                &mut mouse,
+                                &mut rel_mouse,
+                                &mouse_pos,
+                                on_abs,
+                                bits,
+                            )
                             .await;
+                        }
                         Reply::Ok
                     }
                     Command::ClickAbs { x, y } => {
-                        mouse_pos.move_abs(x, y);
-                        let (on_abs, bits) = latches.press(Button::Left, true);
-                        emit_pointer_buttons(&mut mouse, &mut rel_mouse, &mouse_pos, on_abs, bits)
+                        // Button ownership is never carried across
+                        // interfaces: while the relative pointer owns the
+                        // primary button, the press below would ride the
+                        // relative pointer and the cursor would never reach
+                        // (x, y). Refuse instead of acking a click at the
+                        // wrong place; an absolute move first re-routes new
+                        // presses after the rel owner releases.
+                        if latches.owner(Button::Left) == Some(false) {
+                            Reply::Err(ErrorCode::Undeliverable)
+                        } else {
+                            mouse_pos.move_abs(x, y);
+                            let (on_abs, bits) = latches.press(Button::Left, true);
+                            emit_pointer_buttons(
+                                &mut mouse,
+                                &mut rel_mouse,
+                                &mouse_pos,
+                                on_abs,
+                                bits,
+                            )
                             .await;
-                        rel_active = false;
-                        Timer::after_millis(inter_ms()).await;
-                        Timer::after_millis(hold_ms()).await;
-                        let (_, bits) =
-                            latches.release(Button::Left).unwrap_or((on_abs, latches.bits(on_abs)));
-                        emit_pointer_buttons(&mut mouse, &mut rel_mouse, &mouse_pos, on_abs, bits)
+                            rel_active = false;
+                            Timer::after_millis(inter_ms()).await;
+                            Timer::after_millis(hold_ms()).await;
+                            let (_, bits) = latches
+                                .release(Button::Left)
+                                .unwrap_or((on_abs, latches.bits(on_abs)));
+                            emit_pointer_buttons(
+                                &mut mouse,
+                                &mut rel_mouse,
+                                &mouse_pos,
+                                on_abs,
+                                bits,
+                            )
                             .await;
-                        Reply::Ok
+                            Reply::Ok
+                        }
                     }
                     Command::Wheel { v, h } => {
                         // The descriptors declare the wheel/pan logical range
@@ -521,28 +551,37 @@ async fn main(spawner: Spawner) {
                         let v = v.clamp(-127, 127);
                         let h = h.clamp(-127, 127);
                         let on_abs = !rel_active;
-                        emit_wheel(
-                            &mut mouse,
-                            &mut rel_mouse,
-                            &mouse_pos,
-                            on_abs,
-                            latches.bits(on_abs),
-                            v,
-                            h,
-                        )
-                        .await;
-                        Timer::after_millis(inter_ms()).await;
-                        emit_wheel(
-                            &mut mouse,
-                            &mut rel_mouse,
-                            &mouse_pos,
-                            on_abs,
-                            latches.bits(on_abs),
-                            0,
-                            0,
-                        )
-                        .await;
-                        Reply::Ok
+                        // The relative descriptor has no AC Pan axis: refuse
+                        // a pan-carrying wheel while it rides the relative
+                        // pointer instead of acking Ok with the pan silently
+                        // dropped. An absolute move re-anchors the wheel on
+                        // the absolute pointer, which carries pan.
+                        if h != 0 && !on_abs {
+                            Reply::Err(ErrorCode::Undeliverable)
+                        } else {
+                            emit_wheel(
+                                &mut mouse,
+                                &mut rel_mouse,
+                                &mouse_pos,
+                                on_abs,
+                                latches.bits(on_abs),
+                                v,
+                                h,
+                            )
+                            .await;
+                            Timer::after_millis(inter_ms()).await;
+                            emit_wheel(
+                                &mut mouse,
+                                &mut rel_mouse,
+                                &mouse_pos,
+                                on_abs,
+                                latches.bits(on_abs),
+                                0,
+                                0,
+                            )
+                            .await;
+                            Reply::Ok
+                        }
                     }
                     Command::ReleaseAll => {
                         kb_keys.clear();
@@ -844,48 +883,6 @@ fn hold_ms() -> u64 {
     u64::from(PACING_HOLD_MS.load(Ordering::Relaxed))
 }
 
-/// Latched keyboard state: modifier bitmap plus up to 6 regular usages.
-struct KeyboardState {
-    modifiers: u8,
-    keycodes: [u8; 6],
-}
-
-impl KeyboardState {
-    const fn new() -> Self {
-        Self { modifiers: 0, keycodes: [0; 6] }
-    }
-
-    /// Latches a usage down; `false` when the 6KRO budget is already full
-    /// and the usage was dropped (the caller reports
-    /// [`ErrorCode::KeyboardFull`] instead of acking).
-    fn down(&mut self, usage: u8) -> bool {
-        if (0xE0..=0xE7).contains(&usage) {
-            self.modifiers |= 1u8 << u32::from(usage - 0xE0);
-            true
-        } else if self.keycodes.contains(&usage) {
-            true
-        } else if let Some(slot) = self.keycodes.iter_mut().find(|slot| **slot == 0) {
-            *slot = usage;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn up(&mut self, usage: u8) {
-        if (0xE0..=0xE7).contains(&usage) {
-            self.modifiers &= !(1u8 << u32::from(usage - 0xE0));
-        } else if let Some(slot) = self.keycodes.iter_mut().find(|slot| **slot == usage) {
-            *slot = 0;
-        }
-    }
-
-    fn clear(&mut self) {
-        self.modifiers = 0;
-        self.keycodes = [0; 6];
-    }
-}
-
 /// Latched absolute-pointer anchor: the last absolutely reported position.
 /// Relative moves do not touch it - they never emit an absolute report - so
 /// the host re-anchors with the real position before any absolute click.
@@ -909,8 +906,8 @@ async fn emit_kb<'a>(
     writer: &mut HidWriter<'a, Driver<'a, USB>, KEYBOARD_REPORT_LEN>,
     kb: &KeyboardState,
 ) {
-    let report =
-        KeyboardReport { modifier: kb.modifiers, reserved: 0, leds: 0, keycodes: kb.keycodes };
+    let (modifier, keycodes) = kb.report();
+    let report = KeyboardReport { modifier, reserved: 0, leds: 0, keycodes };
     if let Err(e) = writer.write_serialize(&report).await {
         warn!("keyboard report failed: {:?}", e);
     }

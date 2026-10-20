@@ -69,6 +69,7 @@ mod tag {
     pub(super) const ERR_NOT_IMPLEMENTED: u8 = 0x04;
     pub(super) const ERR_KEYBOARD_FULL: u8 = 0x05;
     pub(super) const ERR_DISABLED: u8 = 0x06;
+    pub(super) const ERR_UNDELIVERABLE: u8 = 0x07;
 }
 
 /// Encodes `cmd` into `out` under sequence number `seq`, zero-padding the
@@ -213,6 +214,7 @@ pub fn encode_reply(seq: u8, reply: &Reply, out: &mut [u8; FRAME_LEN]) {
                 ErrorCode::NotImplemented => tag::ERR_NOT_IMPLEMENTED,
                 ErrorCode::KeyboardFull => tag::ERR_KEYBOARD_FULL,
                 ErrorCode::Disabled => tag::ERR_DISABLED,
+                ErrorCode::Undeliverable => tag::ERR_UNDELIVERABLE,
             };
         }
     }
@@ -246,6 +248,7 @@ pub fn decode_reply(data: &[u8]) -> Result<(u8, Reply), FrameError> {
                 tag::ERR_NOT_IMPLEMENTED => ErrorCode::NotImplemented,
                 tag::ERR_KEYBOARD_FULL => ErrorCode::KeyboardFull,
                 tag::ERR_DISABLED => ErrorCode::Disabled,
+                tag::ERR_UNDELIVERABLE => ErrorCode::Undeliverable,
                 _ => return Err(FrameError::UnknownTag),
             })
         }
@@ -429,6 +432,7 @@ mod tests {
             Reply::Err(ErrorCode::NotImplemented),
             Reply::Err(ErrorCode::KeyboardFull),
             Reply::Err(ErrorCode::Disabled),
+            Reply::Err(ErrorCode::Undeliverable),
         ];
         for reply in samples {
             let mut buf = [0u8; FRAME_LEN];

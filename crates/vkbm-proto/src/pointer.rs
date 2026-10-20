@@ -77,6 +77,14 @@ impl PointerLatches {
         if on_abs { self.abs } else { self.rel }
     }
 
+    /// The owner of `button`'s press, if held: `Some(true)` = absolute
+    /// pointer, `Some(false)` = relative pointer, `None` = not held.
+    #[must_use]
+    pub fn owner(&self, button: Button) -> Option<bool> {
+        let slot = usize::from(button as u8 - 1);
+        self.owner.get(slot).copied().flatten()
+    }
+
     /// Releases everything; both interfaces report zero buttons next.
     pub fn clear(&mut self) {
         self.abs = 0;
@@ -124,8 +132,20 @@ mod tests {
         let mut l = PointerLatches::new();
         l.press(Button::Left, true);
         assert_eq!(l.press(Button::Left, false), (true, 1), "owner keeps the press");
+        assert_eq!(l.owner(Button::Left), Some(true));
         assert_eq!(l.release(Button::Left), Some((true, 0)));
         assert_eq!(l.bits(false), 0, "no stranded bits on the losing interface");
+    }
+
+    #[test]
+    fn owner_reports_the_holding_interface() {
+        let mut l = PointerLatches::new();
+        assert_eq!(l.owner(Button::Left), None, "released: no owner");
+        l.press(Button::Left, false);
+        assert_eq!(l.owner(Button::Left), Some(false), "relative owner");
+        l.release(Button::Left);
+        l.press(Button::Left, true);
+        assert_eq!(l.owner(Button::Left), Some(true), "absolute owner");
     }
 
     #[test]

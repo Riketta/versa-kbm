@@ -92,6 +92,12 @@ jobs:
         working-directory: crates/vkbm-fw
         run: cargo build --release --locked
 
+      # Clippy alone does not link: prove the CDC build (two extra USB
+      # interfaces, larger descriptor budget) still produces a binary.
+      - name: Build release ELF (dev-cdc bench channel)
+        working-directory: crates/vkbm-fw
+        run: cargo build --release --locked --features dev-cdc
+
       # Cargo writes the extension-less ELF (`vkbm-fw`); stage a `.elf`
       # copy so the downloaded artifact is self-describing for flashing.
       - name: Stage firmware image

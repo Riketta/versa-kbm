@@ -14,12 +14,84 @@
 pub mod chunks;
 pub mod dedup;
 pub mod frame;
+pub mod keyboard;
 pub mod line;
 pub mod pointer;
 
 /// Highest coordinate accepted by the absolute-mouse mapping. This is the HID
 /// logical maximum; the OS scales the range across the desktop.
 pub const ABS_MAX: u16 = 32_767;
+
+/// Major part of a `major.minor.patch` version string (`"0.6.0"` -> 0).
+/// Anything longer than one digit contributes its leading digit.
+#[must_use]
+pub const fn semver_major(version: &str) -> u8 {
+    leading_digit(version.as_bytes())
+}
+
+/// Minor part of a `major.minor.patch` version string (`"0.12.3"` -> 12),
+/// accumulated in full so two-digit minors survive the wire's u8. Overflow
+/// saturates.
+#[must_use]
+pub const fn semver_minor(version: &str) -> u8 {
+    let bytes = version.as_bytes();
+    // Skip past the first `.` (the major/minor separator).
+    let mut rest = bytes;
+    while let Some((&b, tail)) = rest.split_first() {
+        rest = tail;
+        if b == b'.' {
+            break;
+        }
+    }
+    // Accumulate every digit before the next separator.
+    let mut minor: u8 = 0;
+    while let Some((&b, tail)) = rest.split_first() {
+        if !b.is_ascii_digit() {
+            break;
+        }
+        minor = minor.saturating_mul(10).saturating_add(b - b'0');
+        rest = tail;
+    }
+    minor
+}
+
+/// First digit of a version part (`b"2"` -> 2).
+const fn leading_digit(bytes: &[u8]) -> u8 {
+    match bytes.split_first() {
+        Some((&b, _)) if b.is_ascii_digit() => b - b'0',
+        _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::{
+        semver_major,
+        semver_minor,
+    };
+
+    #[test]
+    fn parses_single_digit_parts() {
+        assert_eq!(semver_major("0.6.0"), 0);
+        assert_eq!(semver_minor("0.6.0"), 6);
+    }
+
+    #[test]
+    fn parses_a_two_digit_minor_in_full() {
+        // The old leading-digit parse reported 0.10.0 as minor 1.
+        assert_eq!(semver_minor("0.10.0"), 10);
+        assert_eq!(semver_minor("0.99.3"), 99);
+        assert_eq!(semver_major("2.1.0"), 2);
+    }
+
+    #[test]
+    fn malformed_versions_degrade_to_zero() {
+        assert_eq!(semver_minor("6"), 0, "no separator: no minor");
+        assert_eq!(semver_minor(""), 0);
+        assert_eq!(semver_major(""), 0);
+        assert_eq!(semver_minor("0.x.3"), 0);
+    }
+}
 
 /// Bits of the [`Reply::Info`] `flags` byte.
 pub mod info_flags {
@@ -114,6 +186,11 @@ pub enum Command {
     },
     /// Moves to an absolute position, then clicks the primary button
     /// (`0..=ABS_MAX` per axis; values above that are clamped by the device).
+    /// While the relative pointer owns the primary button, the click is
+    /// refused with [`ErrorCode::Undeliverable`] instead of acking a click
+    /// at the wrong place: button ownership is never carried across
+    /// interfaces, so the press would ride the relative pointer and the
+    /// cursor would never reach `(x, y)`.
     ClickAbs {
         /// Absolute X.
         x: u16,
@@ -122,7 +199,11 @@ pub enum Command {
     },
     /// Scrolls: vertical `v` and horizontal `h` wheel ticks. Values outside
     /// `-127..=127` are clamped by the firmware (the HID descriptor declares
-    /// that logical range).
+    /// that logical range). The wheel rides the pointer interface that moved
+    /// last, and the relative descriptor has no pan axis: a pan-carrying
+    /// (`h != 0`) wheel while the relative pointer is active is refused with
+    /// [`ErrorCode::Undeliverable`] instead of silently dropping the pan -
+    /// an absolute move first puts the wheel back on the absolute pointer.
     Wheel {
         /// Vertical ticks.
         v: i8,
@@ -193,6 +274,12 @@ pub enum ErrorCode {
     /// someone toggles it back on at the device. Software cannot clear this
     /// state - that is the point of the switch.
     Disabled,
+    /// The command's effect cannot be delivered on the current pointer
+    /// state: a pan-carrying wheel while the wheel rides the relative
+    /// pointer (which has no pan axis), or [`Command::ClickAbs`] while the
+    /// relative pointer owns the primary button. Deliver the precondition
+    /// (an absolute move) and retry.
+    Undeliverable,
 }
 
 /// Command routing shared by host and firmware: which commands start new

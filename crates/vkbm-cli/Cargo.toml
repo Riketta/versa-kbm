@@ -5,6 +5,12 @@ version.workspace = true
 edition.workspace = true
 publish = false
 
+# The tool is documented and distributed as `vkbm`; name the binary
+# accordingly instead of after the package.
+[[bin]]
+name = "vkbm"
+path = "src/main.rs"
+
 [lints]
 workspace = true
 

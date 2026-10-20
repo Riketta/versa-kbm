@@ -107,8 +107,8 @@ vkbm move 16384 16384     # pointer to center (coordinates are 0..=32767)
 vkbm move-rel -100 0      # pointer by a delta (goes through OS pointer ballistics)
 vkbm press 4096 4096      # move + left-click
 vkbm key 44               # tap space (HID usage code; 41 = ESC)
-vkbm mouse click right    # click a button at the current position
-vkbm wheel 3              # scroll up; horizontal: vkbm wheel 0 -3
+vkbm mouse click right    # click through the pointer that moved last (see help)
+vkbm wheel 3              # scroll up; horizontal: vkbm wheel 0 -3 (absolute move first)
 vkbm pacing 4 10          # step gap / button hold, in milliseconds
 vkbm dry-run on           # commands echo back, nothing actuates
 vkbm dry-run off          # back to real actuation (also: off after reboot)
@@ -204,6 +204,11 @@ Change the constants if your use case needs a different appearance.
   software — unplug the device when that matters. The BOOTSEL hardware
   switch *does* bind hostile software (it cannot be toggled over USB), at
   the cost of physical access to flip it back.
+- The optional `dev-cdc` bench port speaks the same command vocabulary over
+  USB serial with the same lack of authentication — and anything that can
+  reach that serial port (locally, or through a network-serial bridge such
+  as ser2net) can actuate. Bench builds only; production builds (no
+  features) enumerate as HID only.
 - The USB identity is a fixed constant near the top of the firmware; it is
   not a guarantee of anything, only an appearance.
 - Relative movement (`move-rel`, line `MR`) emits true relative reports on

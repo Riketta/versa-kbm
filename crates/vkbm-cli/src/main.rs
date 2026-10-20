@@ -42,8 +42,14 @@ struct Cli {
     /// USB product id override (decimal, or hex with a 0x prefix).
     #[arg(long, global = true, default_value_t = DEFAULT_PID, value_parser = usb_id)]
     pid: u16,
-    /// Ack timeout override, in milliseconds.
-    #[arg(long, global = true, default_value_t = ACK_TIMEOUT_MS)]
+    /// Ack timeout override, in milliseconds (`1..=60000`; the cap keeps
+    /// the ack deadline arithmetic far from overflow).
+    #[arg(
+        long,
+        global = true,
+        default_value_t = ACK_TIMEOUT_MS,
+        value_parser = clap::value_parser!(u64).range(1..=60_000)
+    )]
     timeout_ms: u64,
 }
 
@@ -79,8 +85,10 @@ enum Cmd {
     /// the raw delta; use `move` when exact placement matters.
     MoveRel {
         /// Signed X delta.
+        #[arg(allow_negative_numbers = true)]
         dx: i16,
         /// Signed Y delta.
+        #[arg(allow_negative_numbers = true)]
         dy: i16,
     },
     /// Move to an absolute position and left-click it.
@@ -103,7 +111,11 @@ enum Cmd {
         #[arg(long, group = "key_mode")]
         up: bool,
     },
-    /// Press, release or click a mouse button at the current position.
+    /// Press, release or click a mouse button through the pointer interface
+    /// that moved last: at the position `move`/`press` placed, at the
+    /// current cursor after `move-rel`, at screen center right after boot
+    /// (the device cannot see the OS cursor - `move` first when placement
+    /// matters).
     Mouse {
         /// What to do with the button.
         action: MouseAction,
@@ -111,11 +123,16 @@ enum Cmd {
         #[arg(default_value = "left")]
         button: MouseButtonName,
     },
-    /// Scroll: vertical ticks, optional horizontal (pan) ticks.
+    /// Scroll: vertical ticks, optional horizontal (pan) ticks. The wheel
+    /// rides the pointer that moved last, and only the absolute pointer has
+    /// a pan axis: after a `move-rel`, a pan-carrying wheel is refused
+    /// (`ERR UNDELIVERABLE`) - `move` first to re-anchor it.
     Wheel {
         /// Vertical ticks (positive = up).
+        #[arg(allow_negative_numbers = true)]
         v: i8,
         /// Horizontal ticks (positive = right).
+        #[arg(allow_negative_numbers = true)]
         h: Option<i8>,
     },
     /// Re-enable actuation after a disarm.
