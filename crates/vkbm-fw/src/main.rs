@@ -457,7 +457,22 @@ async fn main(spawner: Spawner) {
                         // one. Only this interface's own button bits ride
                         // along (a press owned elsewhere is never carried).
                         let mut stream = chunks::plan(dx, dy).peekable();
+                        // A stream can run for seconds - a killswitch closing
+                        // mid-flight must stop it at the next report step
+                        // instead of letting the whole move land behind a
+                        // closed gate. Landing short is safe: hosts verify
+                        // placement before pressing. The last move was still
+                        // a relative one, so presses keep riding this
+                        // interface either way.
+                        let mut gate_closed = None;
                         while let Some(chunk) = stream.next() {
+                            if let Some(code) = routing::gate_error(
+                                ENABLED.load(Ordering::Relaxed),
+                                ARMED.load(Ordering::Relaxed),
+                            ) {
+                                gate_closed = Some(code);
+                                break;
+                            }
                             emit_rel_mouse(&mut rel_mouse, latches.bits(true), 0, chunk.0, chunk.1)
                                 .await;
                             if stream.peek().is_some() {
@@ -465,7 +480,10 @@ async fn main(spawner: Spawner) {
                             }
                         }
                         rel_active = true;
-                        Reply::Ok
+                        match gate_closed {
+                            Some(code) => Reply::Err(code),
+                            None => Reply::Ok,
+                        }
                     }
                     Command::MouseDown { button } => {
                         let (on_abs, bits) = latches.press(button, !rel_active);
@@ -784,6 +802,10 @@ async fn dispatch(caller: Caller, cmd: Command) -> Reply {
         }
         Command::Disarm => {
             ARMED.store(false, Ordering::Relaxed);
+            // Same rule as the hardware switch: nothing stays latched behind
+            // a closed gate. The release is fire-and-forget (Caller::Switch
+            // pairs with no reply) and bypasses both gates in the actuator.
+            ACT_CMD.send((Caller::Switch, Command::ReleaseAll)).await;
             Reply::Ok
         }
         Command::SetPacing { inter_ms, hold_ms } => {

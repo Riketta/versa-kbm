@@ -29,7 +29,10 @@ needed.
   button down/up, move-and-click, wheel/pan scrolling (pan rides the
   absolute pointer - the relative descriptor has no pan axis), release-all,
   pacing.
-- Soft killswitch: `DISARM` refuses every actuation command until `ARM`.
+- Soft killswitch: `DISARM` refuses every actuation command until `ARM`, and
+  releases every held key and button when it lands — same rule as the hardware
+  switch. A chunked `move-rel` stream stops at the next report step when either
+  gate closes mid-flight.
 - Hardware master switch: a tap on BOOTSEL disables actuation at the device
   itself; software cannot clear it. Switching off also releases every held
   key and button. Releases (`RELEASE`, key/button up) always work, no
@@ -109,7 +112,7 @@ vkbm wheel 3              # scroll up; horizontal: vkbm wheel 0 -3
 vkbm pacing 4 10          # step gap / button hold, in milliseconds
 vkbm dry-run on           # commands echo back, nothing actuates
 vkbm dry-run off          # back to real actuation (also: off after reboot)
-vkbm disarm               # killswitch: actuation refused until...
+vkbm disarm               # soft killswitch: releases + refuses until...
 vkbm arm                  # ...re-armed (vkbm release lets go of everything)
 ```
 
@@ -128,11 +131,15 @@ independently of any software:
 
 - **Off:** every actuation command is refused with `ERR DISABLED`; held
   keys and buttons are released the moment the toggle lands, and any
-  actuation still queued but not yet executed is dropped at the gate (only
-  a command already mid-sequence can finish). The host can see the state
-  (`vkbm info` prints `switch=off`) but cannot clear it.
+  actuation still queued but not yet executed is dropped at the gate. A
+  command already mid-sequence finishes only if it is short (click, key
+  tap, wheel pulse - milliseconds); a chunked `move-rel` stream aborts at
+  its next report step and acks `ERR DISABLED`. The host can see the
+  state (`vkbm info` prints `switch=off`) but cannot clear it.
 - **On:** the device acts normally, still subject to the soft
-  `DISARM`/`ARM` gate.
+  `DISARM`/`ARM` gate, which behaves the same way: closing it releases
+  everything held and aborts a chunked stream at the next step
+  (`ERR DISARMED`).
 - The board LED is solid only when the device can actuate (switch on and
   armed); it blinks slowly whenever either gate is closed.
 - Holding BOOTSEL during power-up still enters the stock USB bootloader
@@ -173,6 +180,13 @@ above that are clamped by the device. Wheel and pan ticks are `i8` on
 the wire, clamped by the firmware to the −127..=127 range its HID
 descriptor declares.
 
+A `move-rel` command is executed as a paced stream of report steps, and
+the device re-checks both gates before every step: flipping the BOOTSEL
+switch or sending `DISARM` while a stream is running stops it at the
+next step, and the command acks `ERR DISABLED`/`ERR DISARMED` (a resend
+replays that cached reply). The cursor simply lands short of the target -
+hosts that need exact placement verify it before pressing.
+
 ## Device identity
 
 The USB identity (VID/PID and strings) is defined by constants near the top
@@ -197,8 +211,10 @@ Change the constants if your use case needs a different appearance.
   to them, so the landed offset can differ from the raw delta (and another
   pointer can move the cursor between reports); use absolute moves when
   exact placement matters.
-- A key or button held across a failed command stays latched;
-  `vkbm release` (line `RA`) always clears everything, even disarmed.
+- A key or button held by a host that then goes away (e.g. a click whose
+  release frame was lost) stays latched until the host lets go,
+  `vkbm release` (line `RA`, always works, even disarmed), `vkbm disarm`,
+  or the BOOTSEL switch - the latter two release everything themselves.
 - Tapping an already-held key or button releases it (a tap is
   press + release).
 - If the firmware itself panics, the last HID report stays latched until
