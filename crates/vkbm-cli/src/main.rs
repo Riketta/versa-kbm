@@ -240,27 +240,15 @@ fn main() -> Result<()> {
         }
         Cmd::Mouse { action, button } => {
             let button = Button::from(button);
-            let cmd = match action {
-                MouseAction::Down => Command::MouseDown { button },
-                MouseAction::Up => Command::MouseUp { button },
-                MouseAction::Click => {
-                    let mut client = open(&api, cli.vid, cli.pid)?;
-                    let clicked = (|| -> Result<()> {
-                        request(&mut client, Command::MouseDown { button }, timeout)?;
-                        std::thread::sleep(Duration::from_millis(CLICK_HOLD_MS));
-                        request(&mut client, Command::MouseUp { button }, timeout)?;
-                        Ok(())
-                    })();
-                    if clicked.is_err() {
-                        // Never leave a button latched on the target: the
-                        // device keeps key/mouse state until released.
-                        let _ = client.request(&Command::ReleaseAll, timeout);
-                        eprintln!("click failed; sent release-all as a safety net");
-                    }
-                    return clicked;
+            match action {
+                MouseAction::Down => {
+                    act(&api, cli.vid, cli.pid, timeout, Command::MouseDown { button })
                 }
-            };
-            act(&api, cli.vid, cli.pid, timeout, cmd)
+                MouseAction::Up => {
+                    act(&api, cli.vid, cli.pid, timeout, Command::MouseUp { button })
+                }
+                MouseAction::Click => click(&api, cli.vid, cli.pid, timeout, button),
+            }
         }
         Cmd::Wheel { v, h } => {
             act(&api, cli.vid, cli.pid, timeout, Command::Wheel { v, h: h.unwrap_or(0) })
@@ -341,13 +329,63 @@ fn info(api: &HidApi, vid: u16, pid: u16, timeout: Duration) -> Result<()> {
 fn act(api: &HidApi, vid: u16, pid: u16, timeout: Duration, cmd: Command) -> Result<()> {
     let mut client = open(api, vid, pid)?;
     let reply = request(&mut client, cmd, timeout)?;
+    report_reply(cmd, reply);
+    Ok(())
+}
+
+/// Reports a reply the way every actuation command does: the dry-run echo
+/// gets the explicit "nothing actuated" line, every other reply prints as
+/// decoded.
+fn report_reply(cmd: Command, reply: vkbm_proto::Reply) {
     match reply {
-        vkbm_proto::Reply::Echo => {
-            println!("dry-run echo: {cmd:?} (nothing actuated)");
-        }
+        vkbm_proto::Reply::Echo => println!("dry-run echo: {cmd:?} (nothing actuated)"),
         other => println!("{other:?}"),
     }
-    Ok(())
+}
+
+/// Two-step click: press, hold, release, reporting each reply like `act`
+/// does. The release-all safety net only fires when a press may actually be
+/// latched on the device: a refused or failed press touched nothing, while a
+/// press that timed out (or a release that failed after a real press) may
+/// have left the button down.
+fn click(api: &HidApi, vid: u16, pid: u16, timeout: Duration, button: Button) -> Result<()> {
+    let mut client = open(api, vid, pid)?;
+    let down = Command::MouseDown { button };
+    let up = Command::MouseUp { button };
+    let mut latched = false;
+    let clicked = (|| -> Result<()> {
+        match request(&mut client, down, timeout) {
+            Ok(reply) => {
+                report_reply(down, reply);
+                // Dry-run echoed the press; a real ack left the button down
+                // for the hold below.
+                latched = !matches!(reply, vkbm_proto::Reply::Echo);
+            }
+            Err(e) => {
+                // A timed-out press (or a read failure after one was sent)
+                // may still have executed; every other failure - gate
+                // refusal, transport error - pressed nothing.
+                if matches!(
+                    e.downcast_ref::<vkbm_cli::Error>(),
+                    Some(vkbm_cli::Error::Timeout | vkbm_cli::Error::Read(_))
+                ) {
+                    latched = true;
+                }
+                return Err(e);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(CLICK_HOLD_MS));
+        report_reply(up, request(&mut client, up, timeout)?);
+        latched = false;
+        Ok(())
+    })();
+    if latched {
+        // Never leave a button latched on the target: the device keeps
+        // key/mouse state until released.
+        let _ = client.request(&Command::ReleaseAll, timeout);
+        eprintln!("click failed; sent release-all as a safety net");
+    }
+    clicked
 }
 
 fn request(client: &mut Client, cmd: Command, timeout: Duration) -> Result<vkbm_proto::Reply> {

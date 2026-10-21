@@ -265,7 +265,10 @@ pub enum ErrorCode {
     /// Device is disarmed ([`Command::Disarm`]); only `Arm`, `Ping`, `Info`
     /// and the configuration commands are served.
     Disarmed,
-    /// Command recognized but not wired into this firmware build yet.
+    /// Command recognized but not wired into this firmware build yet. A
+    /// wire-reserved value: the current firmware never emits it, but the
+    /// host still decodes the tag so peers speaking the same vocabulary
+    /// stay understood.
     NotImplemented,
     /// Keyboard 6KRO budget already full: the usage was dropped, not
     /// latched, so the tap would have been a no-op.

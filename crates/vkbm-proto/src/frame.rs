@@ -194,20 +194,20 @@ pub fn decode(data: &[u8]) -> Result<(u8, Command), FrameError> {
 
 /// Encodes a reply under sequence number `seq`.
 pub fn encode_reply(seq: u8, reply: &Reply, out: &mut [u8; FRAME_LEN]) {
-    let mut buf = [0u8; FRAME_LEN];
-    buf[0] = seq;
+    *out = [0u8; FRAME_LEN];
+    out[0] = seq;
     match *reply {
-        Reply::Ok => buf[1] = tag::REPLY_OK,
-        Reply::Echo => buf[1] = tag::REPLY_ECHO,
+        Reply::Ok => out[1] = tag::REPLY_OK,
+        Reply::Echo => out[1] = tag::REPLY_ECHO,
         Reply::Info { major, minor, flags } => {
-            buf[1] = tag::REPLY_INFO;
-            buf[2] = major;
-            buf[3] = minor;
-            buf[4] = flags;
+            out[1] = tag::REPLY_INFO;
+            out[2] = major;
+            out[3] = minor;
+            out[4] = flags;
         }
         Reply::Err(code) => {
-            buf[1] = tag::REPLY_ERR;
-            buf[2] = match code {
+            out[1] = tag::REPLY_ERR;
+            out[2] = match code {
                 ErrorCode::UnknownCommand => tag::ERR_UNKNOWN_COMMAND,
                 ErrorCode::BadPayload => tag::ERR_BAD_PAYLOAD,
                 ErrorCode::Disarmed => tag::ERR_DISARMED,
@@ -218,7 +218,6 @@ pub fn encode_reply(seq: u8, reply: &Reply, out: &mut [u8; FRAME_LEN]) {
             };
         }
     }
-    *out = buf;
 }
 
 /// Decodes one reply frame; returns `(seq, reply)`.

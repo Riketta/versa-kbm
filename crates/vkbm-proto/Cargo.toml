@@ -3,6 +3,7 @@ name = "vkbm-proto"
 description = "Wire contract between the versa-kbm host tools and the RP2040 firmware: command vocabulary plus binary (HID) and line (CDC) encodings."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish = false
 
 [lints]

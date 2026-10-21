@@ -208,7 +208,10 @@ Change the constants if your use case needs a different appearance.
   USB serial with the same lack of authentication — and anything that can
   reach that serial port (locally, or through a network-serial bridge such
   as ser2net) can actuate. Bench builds only; production builds (no
-  features) enumerate as HID only.
+  features) enumerate as HID only. The serial line channel also has no
+  dedup: unlike the vendor channel's sequence numbers, a retried line
+  double-executes. And when the vendor channel's OUT queue drops a frame,
+  that drop relies on the host's single resend to recover it.
 - The USB identity is a fixed constant near the top of the firmware; it is
   not a guarantee of anything, only an appearance.
 - Relative movement (`move-rel`, line `MR`) emits true relative reports on

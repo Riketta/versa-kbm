@@ -1,8 +1,9 @@
 [package]
 name = "vkbm-fw"
 description = "versa-kbm RP2040 firmware: composite HID keyboard + absolute/relative mouse + vendor control channel."
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
+rust-version = "1.87"
 publish = false
 
 # Standalone crate (excluded from the workspace): thumbv6m target, own

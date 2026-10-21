@@ -403,34 +403,48 @@ async fn main(spawner: Spawner) {
                 }
                 None => match cmd {
                     Command::KeyDown { usage } => {
-                        if kb_keys.down(usage) {
-                            emit_kb(&mut kb, &kb_keys).await;
-                            Reply::Ok
+                        if KeyboardState::is_valid_usage(usage) {
+                            if kb_keys.down(usage) {
+                                emit_kb(&mut kb, &kb_keys).await;
+                                Reply::Ok
+                            } else {
+                                // Dropped, not latched: report it instead of acking
+                                // a tap that would never happen.
+                                Reply::Err(ErrorCode::KeyboardFull)
+                            }
                         } else {
-                            // Dropped, not latched: report it instead of acking
-                            // a tap that would never happen.
-                            Reply::Err(ErrorCode::KeyboardFull)
+                            // Usages the flashed descriptor cannot report:
+                            // reject them without touching the latched state.
+                            Reply::Err(ErrorCode::BadPayload)
                         }
                     }
                     Command::KeyUp { usage } => {
-                        kb_keys.up(usage);
-                        emit_kb(&mut kb, &kb_keys).await;
-                        Reply::Ok
-                    }
-                    Command::KeyTap { usage } => {
-                        if kb_keys.down(usage) {
-                            emit_kb(&mut kb, &kb_keys).await;
-                            Timer::after_millis(hold_ms()).await;
+                        if KeyboardState::is_valid_usage(usage) {
                             kb_keys.up(usage);
                             emit_kb(&mut kb, &kb_keys).await;
                             Reply::Ok
                         } else {
-                            Reply::Err(ErrorCode::KeyboardFull)
+                            Reply::Err(ErrorCode::BadPayload)
+                        }
+                    }
+                    Command::KeyTap { usage } => {
+                        if KeyboardState::is_valid_usage(usage) {
+                            if kb_keys.down(usage) {
+                                emit_kb(&mut kb, &kb_keys).await;
+                                Timer::after_millis(hold_ms()).await;
+                                kb_keys.up(usage);
+                                emit_kb(&mut kb, &kb_keys).await;
+                                Reply::Ok
+                            } else {
+                                Reply::Err(ErrorCode::KeyboardFull)
+                            }
+                        } else {
+                            Reply::Err(ErrorCode::BadPayload)
                         }
                     }
                     Command::MouseMoveAbs { x, y } => {
                         mouse_pos.move_abs(x, y);
-                        emit_mouse(&mut mouse, &mouse_pos, latches.bits(false), 0, 0).await;
+                        emit_mouse(&mut mouse, &mouse_pos, &latches, 0, 0).await;
                         rel_active = false;
                         Reply::Ok
                     }
@@ -457,8 +471,7 @@ async fn main(spawner: Spawner) {
                                 gate_closed = Some(code);
                                 break;
                             }
-                            emit_rel_mouse(&mut rel_mouse, latches.bits(true), 0, chunk.0, chunk.1)
-                                .await;
+                            emit_rel_mouse(&mut rel_mouse, &latches, 0, chunk.0, chunk.1).await;
                             if stream.peek().is_some() {
                                 Timer::after_millis(inter_ms()).await;
                             }
@@ -527,7 +540,9 @@ async fn main(spawner: Spawner) {
                             )
                             .await;
                             rel_active = false;
-                            Timer::after_millis(inter_ms()).await;
+                            // The click holds for `hold_ms`, exactly like a
+                            // key tap; the step gap has no place between a
+                            // click's halves.
                             Timer::after_millis(hold_ms()).await;
                             let (_, bits) = latches
                                 .release(Button::Left)
@@ -588,9 +603,10 @@ async fn main(spawner: Spawner) {
                         emit_kb(&mut kb, &kb_keys).await;
                         latches.clear();
                         // Both pointers: the safety release must unlatch
-                        // whatever either interface still reports.
-                        emit_mouse(&mut mouse, &mouse_pos, 0, 0, 0).await;
-                        emit_rel_mouse(&mut rel_mouse, 0, 0, 0, 0).await;
+                        // whatever either interface still reports. After the
+                        // clear, both writers report zero buttons.
+                        emit_mouse(&mut mouse, &mouse_pos, &latches, 0, 0).await;
+                        emit_rel_mouse(&mut rel_mouse, &latches, 0, 0, 0).await;
                         Reply::Ok
                     }
                     // Dispatch never routes config commands here.
@@ -913,7 +929,36 @@ async fn emit_kb<'a>(
     }
 }
 
+/// Emits one absolute-mouse report at `anchor`'s position. The absolute
+/// pointer's own latched buttons always ride along; a press owned by the
+/// relative pointer is never carried, so the button bits cannot be mis-wired
+/// at a call site.
 async fn emit_mouse<'a>(
+    writer: &mut HidWriter<'a, Driver<'a, USB>, MOUSE_REPORT_LEN>,
+    anchor: &MouseState,
+    latches: &PointerLatches,
+    wheel: i8,
+    pan: i8,
+) {
+    emit_abs_report(writer, anchor, latches.bits(true), wheel, pan).await;
+}
+
+/// Emits one relative-mouse report: the relative pointer's own latched
+/// buttons, a wheel tick and X/Y deltas. Like [`emit_mouse`], the bits come
+/// from the latches of the interface doing the emitting.
+async fn emit_rel_mouse<'a>(
+    writer: &mut HidWriter<'a, Driver<'a, USB>, REL_MOUSE_REPORT_LEN>,
+    latches: &PointerLatches,
+    wheel: i8,
+    dx: i8,
+    dy: i8,
+) {
+    emit_rel_report(writer, latches.bits(false), wheel, dx, dy).await;
+}
+
+/// Emits one absolute-mouse report with explicit button bits: `buttons`,
+/// wheel and pan ticks at `anchor`'s position.
+async fn emit_abs_report<'a>(
     writer: &mut HidWriter<'a, Driver<'a, USB>, MOUSE_REPORT_LEN>,
     anchor: &MouseState,
     buttons: u8,
@@ -936,8 +981,9 @@ async fn emit_mouse<'a>(
     }
 }
 
-/// Emits one relative-mouse report: held buttons, wheel tick and X/Y deltas.
-async fn emit_rel_mouse<'a>(
+/// Emits one relative-mouse report with explicit button bits: `buttons`, a
+/// wheel tick and the X/Y deltas.
+async fn emit_rel_report<'a>(
     writer: &mut HidWriter<'a, Driver<'a, USB>, REL_MOUSE_REPORT_LEN>,
     buttons: u8,
     wheel: i8,
@@ -969,9 +1015,9 @@ async fn emit_pointer_buttons<'a>(
     buttons: u8,
 ) {
     if on_abs {
-        emit_mouse(abs, anchor, buttons, 0, 0).await;
+        emit_abs_report(abs, anchor, buttons, 0, 0).await;
     } else {
-        emit_rel_mouse(rel, buttons, 0, 0, 0).await;
+        emit_rel_report(rel, buttons, 0, 0, 0).await;
     }
 }
 
@@ -987,9 +1033,9 @@ async fn emit_wheel<'a>(
     h: i8,
 ) {
     if on_abs {
-        emit_mouse(abs, anchor, buttons, v, h).await;
+        emit_abs_report(abs, anchor, buttons, v, h).await;
     } else {
-        emit_rel_mouse(rel, buttons, v, 0, 0).await;
+        emit_rel_report(rel, buttons, v, 0, 0).await;
     }
 }
 
@@ -1004,8 +1050,8 @@ mod cdc {
         Reply,
         line::{
             self,
+            LineAssembler,
             LineError,
-            MAX_LINE_LEN,
         },
     };
 
@@ -1021,11 +1067,10 @@ mod cdc {
 
     /// Serves ASCII command lines until the device is unplugged.
     pub async fn run<'a>(mut class: CdcAcmClass<'a, Driver<'a, USB>>) {
-        let mut line = [0u8; MAX_LINE_LEN + 1];
-        let mut len;
+        let mut assembler = LineAssembler::new();
         loop {
             class.wait_connection().await;
-            len = 0;
+            assembler.reset();
             loop {
                 let mut pkt = [0u8; 64];
                 let n = match class.read_packet(&mut pkt).await {
@@ -1035,30 +1080,23 @@ mod cdc {
                         break;
                     }
                 };
-                let mut overflow = false;
-                for &b in pkt.iter().take(n) {
-                    if b == b'\n' {
-                        if overflow {
-                            respond(&mut class, &Reply::Err(ErrorCode::BadPayload)).await;
-                        } else {
-                            let (used, _) = line.split_at(len);
-                            match line::decode(used) {
-                                Ok(cmd) => {
-                                    respond(&mut class, &dispatch(Caller::Cdc, cmd).await).await;
-                                }
-                                Err(LineError::Empty) => {}
-                                Err(_) => {
-                                    respond(&mut class, &Reply::Err(ErrorCode::BadPayload)).await;
-                                }
+                for &byte in pkt.iter().take(n) {
+                    match assembler.feed_byte(byte) {
+                        // A line landed: decode and serve it.
+                        Some(Ok(line)) => match line::decode(line) {
+                            Ok(cmd) => {
+                                respond(&mut class, &dispatch(Caller::Cdc, cmd).await).await;
                             }
+                            Err(LineError::Empty) => {}
+                            Err(_) => {
+                                respond(&mut class, &Reply::Err(ErrorCode::BadPayload)).await;
+                            }
+                        },
+                        // Overflowed input is dropped, answered like a bad line.
+                        Some(Err(_)) => {
+                            respond(&mut class, &Reply::Err(ErrorCode::BadPayload)).await;
                         }
-                        len = 0;
-                        overflow = false;
-                    } else if let Some(slot) = line.split_at_mut(len).1.first_mut() {
-                        *slot = b;
-                        len += 1;
-                    } else {
-                        overflow = true;
+                        None => {}
                     }
                 }
             }
@@ -1102,16 +1140,17 @@ impl RequestHandler for VendorHandler {
 
     fn set_report(&mut self, id: ReportId, data: &[u8]) -> OutResponse {
         if matches!(id, ReportId::Out(_)) {
-            let mut frame = [0u8; FRAME_LEN];
-            let n = data.len().min(FRAME_LEN);
-            let (dst, _) = frame.split_at_mut(n);
-            for (d, s) in dst.iter_mut().zip(data.iter()) {
-                *d = *s;
-            }
-            if VENDOR_EVENTS.try_send(frame).is_err() {
-                // The host client resends after its ack timeout, so dropping
-                // is safe; log it for bench visibility.
-                warn!("vendor queue full; frame dropped (host will resend)");
+            // The wire frame is exactly FRAME_LEN bytes. A short report must
+            // not be zero-padded into something decodable, and nothing longer
+            // fits the report contract: drop both instead of guessing.
+            if let Ok(frame) = <[u8; FRAME_LEN]>::try_from(data) {
+                if VENDOR_EVENTS.try_send(frame).is_err() {
+                    // The host client resends after its ack timeout, so dropping
+                    // is safe; log it for bench visibility.
+                    warn!("vendor queue full; frame dropped (host will resend)");
+                }
+            } else {
+                warn!("vendor report dropped: {} bytes (want {})", data.len(), FRAME_LEN);
             }
         }
         OutResponse::Accepted

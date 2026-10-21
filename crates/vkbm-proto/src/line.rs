@@ -323,6 +323,68 @@ fn button(tok: &[u8]) -> Result<Button, LineError> {
     Err(LineError::BadButton)
 }
 
+/// Assembles `\n`-terminated command lines from arbitrary byte chunks: the
+/// CDC bench channel's byte feeder. A line may split across any number of
+/// writes; bytes beyond [`MAX_LINE_LEN`] are dropped, and the line is
+/// reported as [`LineError::TooLong`] when its terminator finally arrives.
+/// Completed lines still go through [`decode`], so an empty line decodes to
+/// [`LineError::Empty`] and stays silently ignorable at the caller.
+#[derive(Debug)]
+pub struct LineAssembler {
+    /// Bytes of the line in progress; once full, further input overflows.
+    line: [u8; MAX_LINE_LEN],
+    /// Bytes of `line` in use; never above `MAX_LINE_LEN`.
+    len: usize,
+    /// Set once the line in progress exceeded `MAX_LINE_LEN`.
+    overflow: bool,
+}
+
+impl LineAssembler {
+    /// Creates an empty assembler.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { line: [0; MAX_LINE_LEN], len: 0, overflow: false }
+    }
+
+    /// Discards any partial line (a fresh serial connection starts empty).
+    pub fn reset(&mut self) {
+        self.len = 0;
+        self.overflow = false;
+    }
+
+    /// Feeds one byte. `Some(result)` when the byte terminated a line:
+    /// `Ok(line)` carries the accumulated bytes (terminator excluded,
+    /// possibly empty), `Err(LineError::TooLong)` reports a line that
+    /// overflowed and was dropped. The returned line borrows the assembler
+    /// and is invalidated by the next call.
+    pub fn feed_byte(&mut self, byte: u8) -> Option<Result<&[u8], LineError>> {
+        if byte == b'\n' {
+            if self.overflow {
+                self.reset();
+                return Some(Err(LineError::TooLong));
+            }
+            let len = self.len;
+            self.reset();
+            let (used, _) = self.line.split_at(len);
+            return Some(Ok(used));
+        }
+        match self.line.get_mut(self.len) {
+            Some(slot) => {
+                *slot = byte;
+                self.len += 1;
+            }
+            None => self.overflow = true,
+        }
+        None
+    }
+}
+
+impl Default for LineAssembler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -486,5 +548,126 @@ mod tests {
     fn flags_tiny_output_buffers() {
         let mut tiny = [0u8; 2];
         assert_eq!(encode(&Command::Ping, &mut tiny), Err(super::EncodeError::TooSmall));
+    }
+}
+
+#[cfg(test)]
+mod assembler_tests {
+    extern crate std;
+
+    use std::{
+        string::String,
+        vec,
+        vec::Vec,
+    };
+
+    use super::{
+        LineAssembler,
+        LineError,
+        MAX_LINE_LEN,
+        decode,
+    };
+    use crate::Command;
+
+    /// Feeds every chunk in order and collects the completed lines as owned
+    /// strings, so table tests can read like transcripts.
+    fn assemble(chunks: &[&str]) -> Vec<Result<String, LineError>> {
+        let mut asm = LineAssembler::new();
+        let mut lines = Vec::new();
+        for chunk in chunks {
+            for &byte in chunk.as_bytes() {
+                if let Some(result) = asm.feed_byte(byte) {
+                    lines.push(result.map(|line| String::from_utf8_lossy(line).into_owned()));
+                }
+            }
+        }
+        lines
+    }
+
+    #[test]
+    fn assembles_a_line_from_one_write() {
+        assert_eq!(assemble(&["PING\n"]), vec![Ok("PING".into())]);
+    }
+
+    #[test]
+    fn assembles_a_line_split_across_writes() {
+        assert_eq!(assemble(&["MO", "VE ", "1 2", "\n"]), vec![Ok("MOVE 1 2".into())]);
+    }
+
+    #[test]
+    fn assembles_every_line_in_one_write() {
+        assert_eq!(
+            assemble(&["PING\nRA\n\n"]),
+            vec![Ok("PING".into()), Ok("RA".into()), Ok(String::new())]
+        );
+    }
+
+    #[test]
+    fn empty_line_decodes_to_empty() {
+        assert_eq!(assemble(&["\n"]), vec![Ok(String::new())]);
+        assert_eq!(decode(b""), Err(LineError::Empty));
+    }
+
+    #[test]
+    fn exactly_max_line_len_still_assembles() {
+        let line = "K".repeat(MAX_LINE_LEN);
+        assert_eq!(assemble(&[&line, "\n"]), vec![Ok(line.clone())]);
+        assert_eq!(decode(line.as_bytes()), Err(LineError::UnknownCommand));
+    }
+
+    #[test]
+    fn one_byte_past_max_overflows() {
+        let line = "K".repeat(MAX_LINE_LEN + 1);
+        assert_eq!(assemble(&[&line, "\n"]), vec![Err(LineError::TooLong)]);
+    }
+
+    #[test]
+    fn bytes_past_max_do_not_leak_into_the_next_line() {
+        let long = "K".repeat(MAX_LINE_LEN) + "XY";
+        assert_eq!(
+            assemble(&[&long, "\n", "RA\n"]),
+            vec![Err(LineError::TooLong), Ok("RA".into())]
+        );
+    }
+
+    #[test]
+    fn overflow_across_writes_stays_overflowed_until_the_newline() {
+        let full = "K".repeat(MAX_LINE_LEN);
+        assert_eq!(assemble(&[&full, "XY", "more", "\n"]), vec![Err(LineError::TooLong)]);
+    }
+
+    #[test]
+    fn recovers_after_an_overflowed_line() {
+        let long = "K".repeat(MAX_LINE_LEN + 5);
+        assert_eq!(
+            assemble(&[&long, "\n", "PING\n"]),
+            vec![Err(LineError::TooLong), Ok("PING".into())]
+        );
+    }
+
+    #[test]
+    fn reset_discards_the_partial_line() {
+        let mut asm = LineAssembler::new();
+        assert!(b"PI".iter().all(|&byte| asm.feed_byte(byte).is_none()));
+        asm.reset();
+        let mut lines = Vec::new();
+        for &byte in b"NG\n" {
+            if let Some(result) = asm.feed_byte(byte) {
+                lines.push(result.map(|line| String::from_utf8_lossy(line).into_owned()));
+            }
+        }
+        assert_eq!(lines, vec![Ok("NG".into())]);
+    }
+
+    #[test]
+    fn assembled_line_feeds_decode() {
+        let mut asm = LineAssembler::new();
+        let mut cmd = None;
+        for &byte in b"CA 16384 4096\n" {
+            if let Some(Ok(line)) = asm.feed_byte(byte) {
+                cmd = decode(line).ok();
+            }
+        }
+        assert_eq!(cmd, Some(Command::ClickAbs { x: 16_384, y: 4_096 }));
     }
 }

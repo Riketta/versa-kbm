@@ -3,6 +3,7 @@ name = "vkbm-cli"
 description = "versa-kbm companion CLI: find the device, handshake, manual actuation."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish = false
 
 # The tool is documented and distributed as `vkbm`; name the binary

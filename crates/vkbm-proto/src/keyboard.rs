@@ -20,6 +20,16 @@ impl KeyboardState {
         Self { modifiers: 0, keycodes: [0; 6] }
     }
 
+    /// Whether `usage` is reportable on the flashed boot-keyboard descriptor:
+    /// the modifier usages `0xE0..=0xE7` and the regular keycodes
+    /// `0x04..=0xDD`. `0x00` is this state machine's empty-slot sentinel,
+    /// `0x01..=0x03` are the ErrorRollOver/POSTFail usages and `0xDE..=0xFF`
+    /// is reserved - none of those may be latched.
+    #[must_use]
+    pub const fn is_valid_usage(usage: u8) -> bool {
+        matches!(usage, 0x04..=0xDD | 0xE0..=0xE7)
+    }
+
     /// Latches `usage` down; `false` when the 6KRO budget is already full
     /// and the usage was dropped (the caller reports
     /// [`crate::ErrorCode::KeyboardFull`] instead of acking).
@@ -121,5 +131,28 @@ mod tests {
         let _ = kb.down(5);
         kb.clear();
         assert_eq!(kb.report(), (0, [0; 6]));
+    }
+
+    #[test]
+    fn usage_validation_matches_the_flashed_descriptor() {
+        assert!(KeyboardState::is_valid_usage(0x04), "first regular keycode");
+        assert!(KeyboardState::is_valid_usage(0x41), "A");
+        assert!(KeyboardState::is_valid_usage(0xDD), "last regular keycode");
+        assert!(KeyboardState::is_valid_usage(0xE0), "left ctrl");
+        assert!(KeyboardState::is_valid_usage(0xE7), "right gui");
+        assert!(!KeyboardState::is_valid_usage(0x00), "empty-slot sentinel");
+        assert!(!KeyboardState::is_valid_usage(0x01), "ErrorRollOver");
+        assert!(!KeyboardState::is_valid_usage(0x02), "POSTFail");
+        assert!(!KeyboardState::is_valid_usage(0x03), "just below the regular range");
+        assert!(!KeyboardState::is_valid_usage(0xDE), "first reserved");
+        assert!(!KeyboardState::is_valid_usage(0xFF), "last reserved");
+    }
+
+    #[test]
+    fn usage_validation_sweeps_the_whole_byte() {
+        let declared = |usage: u8| (0x04..=0xDD).contains(&usage) || (0xE0..=0xE7).contains(&usage);
+        for usage in 0..=u8::MAX {
+            assert_eq!(KeyboardState::is_valid_usage(usage), declared(usage), "usage {usage:#04x}");
+        }
     }
 }
